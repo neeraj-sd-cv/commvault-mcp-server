@@ -269,3 +269,51 @@ def filter_security_associations_response(api_response):
             ]
         filtered.append(filtered_assoc)
     return {"associations": filtered}
+
+
+def filter_aws_permissions_cft_response(api_response):
+    articles = api_response.get("cloudConnectionArticlesList", [])
+    result = {}
+
+    for article in articles:
+        raw_type = article.get("cloudConnectionType", "")
+        if raw_type == "ORGANIZATION":
+            key = "organization"
+        elif raw_type == "CLOUD_ACCOUNT":
+            key = "account"
+        else:
+            key = raw_type
+
+        entry = {
+            "cftQuickCreateUrl": article.get("hostedInfrastructureCftUrl", ""),
+            "iamRoleArn": article.get("iamRoleArn", ""),
+            "externalId": article.get("externalId", ""),
+            "userInstructions": (
+                "Open the CloudFormation quick-create URL below in your AWS Console. "
+                "Review the stack parameters and click 'Create stack'. "
+                "Wait for the stack status to show CREATE_COMPLETE before confirming."
+            ),
+        }
+
+        member = article.get("memberAccountArticles")
+        if member:
+            entry["memberAccountSetup"] = {
+                "templateUrl": member.get("templateUrl", ""),
+                "hostedInfraRoleArn": member.get("hostedInfraRoleArn", ""),
+                "hostedInfraUserArn": member.get("hostedInfraUserArn", ""),
+            }
+            entry["memberAccountInstructions"] = (
+                "Configure IAM role in Member AWS Accounts:\n\n"
+                "1. Sign in to the delegated admin account and go to "
+                "https://console.aws.amazon.com/cloudformation/home#/stacksets/create\n"
+                "2. Select 'Specify template' and paste the Amazon S3 URL shown below.\n"
+                "3. In the Parameters section, paste the Commvault Cloud IAM Role ARN "
+                "and User ARN shown below.\n"
+                "4. Proceed with default options and submit the StackSet.\n\n"
+                "This creates IAM roles in member accounts for resource discovery, "
+                "backup, and restore."
+            )
+
+        result[key] = entry
+
+    return {"connectionTypes": result}

@@ -29,6 +29,7 @@ from .storage_tools import STORAGE_MANAGEMENT_TOOLS
 from .user_tools import USER_MANAGEMENT_TOOLS
 from .docusign_tools import DOCUSIGN_TOOLS
 from .salesforce_tools import SALESFORCE_TOOLS
+from .aws_cloud_tools import AWS_CLOUD_TOOLS
 
 # All available tool categories
 ALL_TOOL_CATEGORIES = [
@@ -41,6 +42,7 @@ ALL_TOOL_CATEGORIES = [
     USER_MANAGEMENT_TOOLS,
     DOCUSIGN_TOOLS,
     SALESFORCE_TOOLS,
+    AWS_CLOUD_TOOLS,
 ]
 
 __all__ = [
@@ -54,4 +56,5 @@ __all__ = [
     'ALL_TOOL_CATEGORIES',
     'DOCUSIGN_TOOLS',
     'SALESFORCE_TOOLS',
+    'AWS_CLOUD_TOOLS',
 ]

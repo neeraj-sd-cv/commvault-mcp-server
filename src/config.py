@@ -111,4 +111,37 @@ class ConfigManager:
 
 # Server constants
 SERVER_NAME = "Commvault MCP Server"
-SERVER_INSTRUCTIONS = "You can use this server to interact with Commvault Product"
+SERVER_INSTRUCTIONS = """You can use this server to interact with Commvault Product.
+
+## AWS Cloud Onboarding Flow
+
+When a user wants to onboard an AWS account, guide them through this workflow:
+
+1. **Collect AWS Account ID** — Ask the user for their AWS account ID (the 12-digit
+   delegated admin account ID). Also ask whether this is an organization-level or
+   single-account connection.
+
+2. **Get permissions CFT** — Call `get_aws_permissions_cft` with the account ID.
+   Present the quick-create URL to the user and instruct them to deploy the
+   CloudFormation stack in the AWS Console.
+
+3. **WAIT** — Pause and wait for the user to confirm the CFT stack deployed
+   successfully. Do NOT proceed until they confirm.
+
+4. **Validate credentials** — Call `validate_aws_cloud_credentials` with the account
+   ID and connection type. If validation fails, suggest the user check their
+   CloudFormation stack status in the AWS Console and retry.
+
+5. **StackSet for organizations** — If the connection type is "organization", present
+   the member-account StackSet instructions from step 2's response. **WAIT** for the
+   user to confirm StackSet deployment before continuing. For single-account
+   connections, skip to step 6.
+
+6. **Browse accounts** — Call `browse_aws_cloud_accounts` to verify account discovery.
+   If no accounts are found, ask the user to verify their StackSet/IAM configuration.
+
+7. **Create connection** — Ask the user for a descriptive connection name, then call
+   `create_aws_cloud_connection` to finalize the onboarding.
+
+Always keep the user informed at each step and confirm success before moving on.
+"""

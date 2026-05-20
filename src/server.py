@@ -61,8 +61,9 @@ def register_tools(mcp_server: FastMCP, tool_categories: List[List[Callable]]) -
     total_tools = 0
     for tool_category in tool_categories:
         for tool_fn in tool_category:
-            # only enable docusign tools if ENABLE_DOCUSIGN_TOOLS is true
             if get_env_var("ENABLE_DOCUSIGN_TOOLS", "false").lower() == "false" and "docusign" in tool_fn.__module__:
+                continue
+            if get_env_var("ENABLE_AWS_CLOUD_TOOLS", "false").lower() == "false" and "aws_cloud" in tool_fn.__module__:
                 continue
             mcp_server.add_tool(Tool.from_function(tool_fn, output_schema=None))
             total_tools += 1

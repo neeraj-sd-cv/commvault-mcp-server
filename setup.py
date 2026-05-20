@@ -441,6 +441,10 @@ def prompt_and_save_keyring(service_name, env_vars):
                     console.print("[red]Refresh token is required when updating access token.[/red]")
                     continue
             
+            # Debug: print captured tokens
+            console.print(f"\n[bold magenta][DEBUG] access_token:[/bold magenta] {access_token}")
+            console.print(f"[bold magenta][DEBUG] refresh_token:[/bold magenta] {refresh_token}\n")
+
             # Validate tokens if server URL is available
             if server_url:
                 is_metallic = env_vars.get('IS_METALLIC', 'false').lower() == 'true'
