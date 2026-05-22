@@ -19,9 +19,17 @@ from pathlib import Path
 from typing import Annotated, Dict, Any
 from pydantic import Field
 
+import json
+
 from src.cv_api_client import commvault_api_client
 from src.logger import logger
-from src.wrappers import filter_aws_permissions_cft_response
+from src.utils import get_env_var
+from src.wrappers import (
+    filter_aws_permissions_cft_response,
+    filter_aws_cloud_connections_response,
+    filter_aws_solutions_response,
+    filter_eligible_plans_response,
+)
 
 
 _CONNECTION_TYPE_MAP = {
@@ -35,6 +43,17 @@ _CFT_CONNECTION_TYPE_MAP = {
     "ORGANIZATION": "organization",
     "CLOUD_ACCOUNT": "account",
 }
+
+
+def _build_job_url(job_id) -> str | None:
+    """Build a Command Center deep-link URL for a given job ID using CC_SERVER_URL."""
+    if not job_id:
+        return None
+    try:
+        server_url = get_env_var("CC_SERVER_URL", default="").rstrip("/")
+        return f"{server_url}/commandcenter/#/jobs/{job_id}"
+    except Exception:
+        return None
 
 
 def _resolve_connection_type(connection_type: str) -> str:
@@ -225,12 +244,271 @@ def create_aws_cloud_connection(
             "V4/Cloud/CloudConnection",
             data=payload,
         )
-        return response
+        result = dict(response)
+        discovery_job_id = (
+            response.get("jobId")
+            or (response.get("jobIds", [None])[0] if isinstance(response.get("jobIds"), list) else None)
+            or response.get("discoveryJobId")
+        )
+        result["summary"] = {
+            "connectionName": connection_name,
+            "connectionId": response.get("id") or response.get("cloudConnectionId"),
+            "discoveryStarted": True,
+            "discoveryJobId": discovery_job_id,
+            "discoveryJobUrl": _build_job_url(discovery_job_id),
+        }
+        return result
     except ValueError as e:
         return {"error": True, "message": str(e)}
     except Exception as e:
         logger.error(f"Error creating AWS cloud connection: {e}")
         return {"error": True, "message": f"Failed to create AWS cloud connection: {str(e)}"}
+
+
+def list_aws_cloud_connections() -> dict:
+    """List all existing AWS cloud connections in Commvault.
+
+    Call this as **step 1** of the AWS protection group setup flow.
+
+    Present the returned connections to the user and ask them to select one.
+    Carry the chosen connection's ``id``, ``name``, ``connectionType``,
+    ``companyName``, and ``companyId`` forward for use in
+    ``create_aws_protection_group``.
+    """
+    try:
+        response = commvault_api_client.get(
+            "V4/Cloud/CloudConnection",
+            params={"vendor": "aws"},
+        )
+        return filter_aws_cloud_connections_response(response)
+    except Exception as e:
+        logger.error(f"Error listing AWS cloud connections: {e}")
+        return {"error": True, "message": f"Failed to list AWS cloud connections: {str(e)}"}
+
+
+def list_aws_workloads() -> dict:
+    """List the AWS workload types available for protection in Commvault.
+
+    Call this as **step 2** of the AWS protection group setup flow, after the
+    user has selected a cloud connection.
+
+    Present the workloads grouped by category (e.g. File Servers, Virtualization,
+    Databases) and ask the user which workloads they want to protect. The user
+    may select any combination across categories.
+
+    Carry the selected workloads (``id`` and ``name`` for each) forward for use
+    in ``create_aws_protection_group``.
+    """
+    try:
+        response = commvault_api_client.get(
+            "v4/solutions",
+            params={"vendor": "aws", "filter": 7},
+        )
+        return filter_aws_solutions_response(response)
+    except Exception as e:
+        logger.error(f"Error listing AWS workloads: {e}")
+        return {"error": True, "message": f"Failed to list AWS workloads: {str(e)}"}
+
+
+def list_eligible_plans() -> dict:
+    """List the backup plans eligible for an AWS protection group.
+
+    Call this as **step 3** of the AWS protection group setup flow, after the
+    user has selected workloads.
+
+    Present the plans (name, summary, RPO, number of copies) and ask the user
+    to choose one. Carry the chosen plan's ``planId`` forward for use in
+    ``create_aws_protection_group``.
+    """
+    try:
+        response = commvault_api_client.get(
+            "v2/plan/Eligible",
+            params={
+                "appId": 104,
+                "filterStoragePools": "true",
+                "operationType": 3,
+                "storageSubType": 6,
+                "fl": (
+                    "plans.plan.planId,plans.plan.planName,plans.numCopies,"
+                    "plans.rpoInMinutes,plans.parent,plans.subtype,plans.type,"
+                    "plans.plan.planSummary,plans.storage.copy"
+                ),
+                "sort": "plans.plan.planName:1",
+            },
+        )
+        return filter_eligible_plans_response(response)
+    except Exception as e:
+        logger.error(f"Error listing eligible plans: {e}")
+        return {"error": True, "message": f"Failed to list eligible plans: {str(e)}"}
+
+
+def create_aws_protection_group(
+    name: Annotated[
+        str,
+        Field(description="A descriptive name for the new protection group."),
+    ],
+    cloud_connection_id: Annotated[
+        int,
+        Field(description="The numeric ID of the selected cloud connection (from list_aws_cloud_connections)."),
+    ],
+    cloud_connection_name: Annotated[
+        str,
+        Field(description="The name of the selected cloud connection."),
+    ],
+    connection_type: Annotated[
+        str,
+        Field(description="The connectionType of the selected cloud connection (e.g. 'OrganizationLevel')."),
+    ],
+    company_name: Annotated[
+        str,
+        Field(description="The company name from the selected cloud connection."),
+    ],
+    company_id: Annotated[
+        int,
+        Field(description="The company ID from the selected cloud connection."),
+    ],
+    plan_id: Annotated[
+        int,
+        Field(description="The planId of the selected backup plan (from list_eligible_plans)."),
+    ],
+    workloads_json: Annotated[
+        str,
+        Field(
+            description=(
+                'JSON array of selected workloads, each with "id" and "name" keys. '
+                'Example: [{"id": 8004, "name": "Amazon Aurora and RDS Snapshot"}, '
+                '{"id": 10301, "name": "Amazon EC2"}]'
+            )
+        ),
+    ],
+    all_cloud_accounts: Annotated[
+        bool,
+        Field(description="Whether to protect all cloud accounts under the connection. Defaults to True."),
+    ] = True,
+) -> dict:
+    """Create a new AWS protection group in Commvault.
+
+    This is the **final step** of the AWS protection group setup flow — call
+    this only after completing all prerequisite steps:
+    1. ``list_aws_cloud_connections`` — user selected a connection
+    2. ``list_aws_workloads`` — user selected workloads to protect
+    3. ``list_eligible_plans`` — user selected a backup plan
+
+    Ask the user for a protection group name before calling this tool.
+    """
+    try:
+        workloads_list = json.loads(workloads_json)
+        workloads_payload = [
+            {"workload": {"id": w["id"], "name": w["name"]}}
+            for w in workloads_list
+        ]
+
+        payload: Dict[str, Any] = {
+            "name": name,
+            "cloudConnection": {
+                "id": cloud_connection_id,
+                "name": cloud_connection_name,
+                "displayName": cloud_connection_name,
+                "cloudType": "aws",
+                "connectionType": connection_type,
+                "company": {
+                    "name": company_name,
+                    "id": company_id,
+                },
+                "selected": True,
+                "hidden": False,
+            },
+            "cloudConnectionId": None,
+            "vendorFromPath": "aws",
+            "disableConnections": False,
+            "allCloudAccounts": all_cloud_accounts,
+            "plan": {"id": plan_id},
+            "cloudAccounts": [],
+            "content": [],
+            "workloads": workloads_payload,
+        }
+
+        response = commvault_api_client.post(
+            "V4/protectiongroup/aws",
+            data=payload,
+        )
+        result = dict(response)
+        result["summary"] = {
+            "protectionGroupName": name,
+            "protectionGroupId": response.get("id") or response.get("subClientId"),
+            "workloadCount": len(workloads_list),
+            "planId": plan_id,
+        }
+        return result
+    except json.JSONDecodeError as e:
+        return {"error": True, "message": f"Invalid workloads_json format: {str(e)}"}
+    except Exception as e:
+        logger.error(f"Error creating AWS protection group: {e}")
+        return {"error": True, "message": f"Failed to create AWS protection group: {str(e)}"}
+
+
+def start_aws_protection_group_backup(
+    protection_group_id: Annotated[
+        int,
+        Field(
+            description=(
+                "The protection group ID returned by create_aws_protection_group. "
+                "This is the Subclient ID used in the backup API path; do not pass "
+                "the cloud connection ID or plan ID."
+            )
+        ),
+    ],
+    backup_level: Annotated[
+        str,
+        Field(description="Backup level to start. Defaults to FULL."),
+    ] = "FULL",
+    notify_user_on_job_completion: Annotated[
+        bool,
+        Field(description="Whether to notify the user when the job completes. Defaults to True."),
+    ] = True,
+    job_description: Annotated[
+        str,
+        Field(description="Description to attach to the backup job."),
+    ] = "Initial full after user onboarding",
+) -> dict:
+    """Start a backup job for an AWS protection group.
+
+    Call this only after ``create_aws_protection_group`` succeeds and the user
+    confirms that the initial backup job can be started.
+
+    The ``protection_group_id`` must be the ID of the created protection group
+    returned by ``create_aws_protection_group``. It is used as the Subclient ID
+    in ``Subclient/{protection_group_id}/action/backup``. Do not use the cloud
+    connection ID or backup plan ID here.
+    """
+    try:
+        response = commvault_api_client.post(
+            f"Subclient/{protection_group_id}/action/backup",
+            params={
+                "backupLevel": backup_level,
+                "notifyUserOnJobCompletion": str(notify_user_on_job_completion).lower(),
+                "jobDescription": job_description,
+            },
+        )
+        result = dict(response)
+        job_id = (
+            response.get("jobIds", [None])[0]
+            if isinstance(response.get("jobIds"), list)
+            else response.get("jobId")
+        )
+        result["summary"] = {
+            "jobId": job_id,
+            "jobUrl": _build_job_url(job_id),
+            "backupLevel": backup_level,
+            "status": "submitted",
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Error starting AWS protection group backup: {e}")
+        return {
+            "error": True,
+            "message": f"Failed to start AWS protection group backup: {str(e)}",
+        }
 
 
 _SKILL_FILE = Path(__file__).parent.parent.parent / ".claude" / "skills" / "aws-onboarding" / "SKILL.md"
@@ -257,4 +535,9 @@ AWS_CLOUD_TOOLS = [
     validate_aws_cloud_credentials,
     browse_aws_cloud_accounts,
     create_aws_cloud_connection,
+    list_aws_cloud_connections,
+    list_aws_workloads,
+    list_eligible_plans,
+    create_aws_protection_group,
+    start_aws_protection_group_backup,
 ]

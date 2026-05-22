@@ -271,6 +271,105 @@ def filter_security_associations_response(api_response):
     return {"associations": filtered}
 
 
+def _connection_type_label(raw: str) -> str:
+    """Convert an API connectionType value to a human-readable label."""
+    mapping = {
+        "OrganizationLevel": "Organization-level",
+        "AccountLevel": "Account-level",
+    }
+    return mapping.get(raw, raw)
+
+
+def _rpo_label(rpo_minutes: int) -> str:
+    """Convert rpoInMinutes to a short, human-readable string."""
+    if rpo_minutes == 0:
+        return "No scheduled RPO"
+    if rpo_minutes < 60:
+        return f"Every {rpo_minutes} minute{'s' if rpo_minutes != 1 else ''}"
+    if rpo_minutes < 1440:
+        hours, mins = divmod(rpo_minutes, 60)
+        label = f"Every {hours}h"
+        if mins:
+            label += f" {mins}m"
+        return label
+    if rpo_minutes < 10080:
+        days = rpo_minutes // 1440
+        return f"Every {days} day{'s' if days != 1 else ''}"
+    if rpo_minutes < 43800:
+        weeks = rpo_minutes // 10080
+        return f"Every {weeks} week{'s' if weeks != 1 else ''}"
+    if rpo_minutes < 525600:
+        months = rpo_minutes // 43800
+        return f"Every {months} month{'s' if months != 1 else ''}"
+    return "Yearly"
+
+
+def filter_aws_cloud_connections_response(api_response):
+    """
+    Extracts minimal, LLM-friendly AWS cloud connection details from the API response.
+    Includes a displayLabel suitable for presenting to users without exposing IDs.
+    """
+    connections = api_response.get("cloudConnections", [])
+    filtered = []
+    for conn in connections:
+        company = conn.get("company", {})
+        conn_type_raw = conn.get("connectionType", "")
+        conn_type_label = _connection_type_label(conn_type_raw)
+        company_name = company.get("name", "")
+        display_name = conn.get("displayName") or conn.get("name", "")
+        filtered.append({
+            "id": conn.get("id"),
+            "name": conn.get("name"),
+            "displayName": display_name,
+            "cloudType": conn.get("cloudType"),
+            "connectionType": conn_type_raw,
+            "companyName": company_name,
+            "companyId": company.get("id"),
+            "displayLabel": f"{display_name} — {conn_type_label}, {company_name}",
+        })
+    return {"totalConnections": len(filtered), "cloudConnections": filtered}
+
+
+def filter_aws_solutions_response(api_response):
+    """
+    Restructures the AWS solutions/workloads response into a grouped,
+    LLM-friendly format keyed by category. Includes workloadCount per category.
+    """
+    categories = []
+    for category in api_response.get("id", []):
+        workloads = [
+            {"id": w.get("id"), "name": w.get("name")}
+            for w in category.get("associatedWorkloads", [])
+        ]
+        categories.append({
+            "categoryId": category.get("id"),
+            "categoryName": category.get("name"),
+            "workloadCount": len(workloads),
+            "workloads": workloads,
+        })
+    return {"categories": categories}
+
+
+def filter_eligible_plans_response(api_response):
+    """
+    Extracts minimal, LLM-friendly plan details from the eligible plans API response.
+    Includes a human-readable rpoLabel alongside the raw rpoInMinutes.
+    """
+    filtered = []
+    for item in api_response.get("plans", []):
+        plan = item.get("plan", {})
+        rpo_minutes = item.get("rpoInMinutes", 0)
+        filtered.append({
+            "planId": plan.get("planId"),
+            "planName": plan.get("planName"),
+            "planSummary": plan.get("planSummary"),
+            "numCopies": item.get("numCopies"),
+            "rpoInMinutes": rpo_minutes,
+            "rpoLabel": _rpo_label(rpo_minutes),
+        })
+    return {"totalPlans": len(filtered), "plans": filtered}
+
+
 def filter_aws_permissions_cft_response(api_response):
     articles = api_response.get("cloudConnectionArticlesList", [])
     result = {}

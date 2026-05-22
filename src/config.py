@@ -113,35 +113,56 @@ class ConfigManager:
 SERVER_NAME = "Commvault MCP Server"
 SERVER_INSTRUCTIONS = """You can use this server to interact with Commvault Product.
 
+## AWS Onboarding and Protection — Output Style Rules
+
+These rules apply to ALL AWS-related flows (onboarding, protection groups, backup):
+
+- **Guided product experience.** Treat every AWS flow as a step-by-step wizard.
+  Never dump tool output or API responses directly into user messages.
+- **One decision at a time.** Ask a single question or present a single confirmation
+  per turn. Do not bundle multiple choices.
+- **Hide internal details.** Retain IDs, ARNs, JSON payloads, and raw API fields
+  internally for tool calls. Only surface them if two items share the same display
+  name, or if the user explicitly asks for technical details.
+- **Product-language milestones.** Refer to stages by name: Connect AWS,
+  Validate Access, Discover Accounts, Create Connection, Choose Workloads,
+  Choose Plan, Create Protection Group, Start Backup.
+- **Compact status messages.** After each action, tell the user what was done and
+  what comes next. Use "Done:" and "Next:" as short prefixes.
+- **Plain-language errors.** On failure, describe what the user should check in AWS
+  Console or Commvault. Avoid stack traces and raw error strings.
+- **Human-readable RPO.** Convert rpoInMinutes to a readable label when presenting
+  plans: 0 → No scheduled RPO, <60 → Every N minutes, <1440 → Every Xh Ym,
+  1440 → Daily, 10080 → Weekly, 43800 → Monthly, ≥525600 → Yearly.
+
 ## AWS Cloud Onboarding Flow
 
-When a user wants to onboard an AWS account, guide them through this workflow:
+When a user wants to onboard an AWS account:
 
-1. **Collect AWS Account ID** — Ask the user for their AWS account ID (the 12-digit
-   delegated admin account ID). Also ask whether this is an organization-level or
-   single-account connection.
+1. Ask for the 12-digit delegated admin AWS account ID.
+2. Call `get_aws_permissions_cft` and show only the CFT quick-create URL with a
+   one-sentence explanation. Wait for the user to confirm CREATE_COMPLETE.
+3. Call `validate_aws_cloud_credentials`. On success confirm access; on failure
+   tell the user what to check in CloudFormation.
+4. For organization connections, present StackSet setup steps using the values from
+   the CFT response. Show only the values the user must copy, not the raw objects.
+   Wait for the user to confirm StackSet deployment.
+5. Call `browse_aws_cloud_accounts` and summarize the count of discovered accounts.
+6. Ask for a connection name, call `create_aws_cloud_connection`, and confirm success.
+   Then ask if the user wants to set up a protection group.
 
-2. **Get permissions CFT** — Call `get_aws_permissions_cft` with the account ID.
-   Present the quick-create URL to the user and instruct them to deploy the
-   CloudFormation stack in the AWS Console.
+## AWS Protection Group Setup
 
-3. **WAIT** — Pause and wait for the user to confirm the CFT stack deployed
-   successfully. Do NOT proceed until they confirm.
+After a connection is created (or independently):
 
-4. **Validate credentials** — Call `validate_aws_cloud_credentials` with the account
-   ID and connection type. If validation fails, suggest the user check their
-   CloudFormation stack status in the AWS Console and retry.
-
-5. **StackSet for organizations** — If the connection type is "organization", present
-   the member-account StackSet instructions from step 2's response. **WAIT** for the
-   user to confirm StackSet deployment before continuing. For single-account
-   connections, skip to step 6.
-
-6. **Browse accounts** — Call `browse_aws_cloud_accounts` to verify account discovery.
-   If no accounts are found, ask the user to verify their StackSet/IAM configuration.
-
-7. **Create connection** — Ask the user for a descriptive connection name, then call
-   `create_aws_cloud_connection` to finalize the onboarding.
-
-Always keep the user informed at each step and confirm success before moving on.
+7. Call `list_aws_cloud_connections` and present connections as a short named list.
+   Ask the user to choose one.
+8. Call `list_aws_workloads` and present workloads grouped by category with names only.
+   Ask the user which workloads to protect.
+9. Call `list_eligible_plans` and present plans as name + human-readable RPO + copy count.
+   Ask the user to choose one.
+10. Ask for a protection group name. Show a one-line confirmation summary (connection,
+    workloads, plan, name). Call `create_aws_protection_group` after confirmation.
+11. Ask if the user wants to start the initial full backup. If yes, call
+    `start_aws_protection_group_backup` using only the created protection group ID.
 """

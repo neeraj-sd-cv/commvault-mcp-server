@@ -20,3 +20,4 @@ wheels/
 # Configuration files
 config/docusign_config.json
 config/*.pem
+.vscode/*
