@@ -350,6 +350,173 @@ def filter_aws_solutions_response(api_response):
     return {"categories": categories}
 
 
+def filter_plan_storage_pool_list(api_response):
+    """
+    Extracts minimal, LLM-friendly storage pool details for plan creation.
+    Handles both bare-list and storagePoolList-wrapped response shapes.
+    """
+    pools = api_response if isinstance(api_response, list) else api_response.get("storagePoolList", [])
+    filtered = []
+    for pool in pools:
+        pool_entity = pool.get("storagePoolEntity", {})
+        policy_entity = pool.get("storagePolicyEntity", {})
+        region = pool.get("region", {})
+        filtered.append({
+            "storagePoolId": pool_entity.get("storagePoolId"),
+            "storagePoolName": pool_entity.get("storagePoolName"),
+            "storagePolicyId": policy_entity.get("storagePolicyId"),
+            "storagePolicyName": policy_entity.get("storagePolicyName"),
+            "regionName": region.get("regionName"),
+            "regionDisplayName": region.get("displayName"),
+            "regionId": region.get("regionId"),
+            "status": pool.get("status"),
+            "storageType": pool.get("storageType"),
+        })
+    return {"totalPools": len(filtered), "storagePools": filtered}
+
+
+def filter_create_storage_pool_response(api_response):
+    """
+    Extracts compact summary from a storage pool creation response.
+    Returns storagePolicyName, storagePolicyId, copyId, copyName and
+    a success flag based on errorCode == 0.
+    """
+    error = api_response.get("error", {})
+    error_code = error.get("errorCode", -1)
+    copy = api_response.get("archiveGroupCopy", {})
+    return {
+        "success": error_code == 0,
+        "errorCode": error_code,
+        "storagePolicyName": copy.get("storagePolicyName"),
+        "storagePolicyId": copy.get("storagePolicyId"),
+        "copyId": copy.get("copyId"),
+        "copyName": copy.get("copyName"),
+    }
+
+
+def filter_create_server_plan_response(api_response):
+    """
+    Extracts compact summary from a server plan creation response.
+    Returns planId, planName and guid, plus a success flag.
+    """
+    plan = api_response.get("plan", {})
+    plan_id = plan.get("id")
+    return {
+        "success": plan_id is not None,
+        "planId": plan_id,
+        "planName": plan.get("name"),
+        "guid": plan.get("GUID"),
+    }
+
+
+def filter_org_units_response(api_response):
+    """
+    Normalises the Organizations ListOrganizationalUnitsForParent response into
+    a minimal LLM-friendly list of {ouId, ouName} dicts.
+    """
+    ous = api_response.get("OrganizationalUnits", [])
+    return {
+        "totalOUs": len(ous),
+        "ous": [{"ouId": ou.get("Id"), "ouName": ou.get("Name")} for ou in ous],
+    }
+
+
+def filter_stackset_status_response(operation_response, instances_response):
+    """
+    Combines describe_stack_set_operation and list_stack_instances responses into
+    a compact progress summary keyed by status counts.
+    """
+    operation = operation_response.get("StackSetOperation", {})
+    overall_status = operation.get("Status", "UNKNOWN")
+
+    counts = {"SUCCEEDED": 0, "RUNNING": 0, "FAILED": 0, "PENDING": 0,
+              "CANCELLED": 0, "STOPPED": 0}
+    failed_accounts = []
+
+    for summary in instances_response.get("Summaries", []):
+        detail = summary.get("StackInstanceStatus", {}).get("DetailedStatus", "UNKNOWN")
+        if detail in counts:
+            counts[detail] += 1
+        elif detail in ("INOPERABLE", "FAILED_IMPORT"):
+            counts["FAILED"] += 1
+        if detail in ("FAILED", "INOPERABLE", "FAILED_IMPORT"):
+            account = summary.get("Account")
+            if account:
+                failed_accounts.append(account)
+
+    total = sum(counts.values())
+    result = {
+        "status": overall_status,
+        "totalInstances": total,
+        "succeeded": counts["SUCCEEDED"],
+        "running": counts["RUNNING"],
+        "failed": counts["FAILED"],
+        "pending": counts["PENDING"],
+    }
+    if failed_accounts:
+        result["failedAccounts"] = failed_accounts
+    return result
+
+
+def filter_member_stackset_check(exists, instances_response, target_ou_id):
+    """
+    Interprets list_stack_instances output scoped to a specific OU and returns
+    a plain state dict:
+      alreadyDeployed / notDeployed / status (RUNNING|FAILED)
+    """
+    if not exists:
+        return {"exists": False, "notDeployed": True}
+
+    summaries = [
+        s for s in instances_response.get("Summaries", [])
+        if s.get("OrganizationalUnitId") == target_ou_id
+    ]
+
+    if not summaries:
+        return {"exists": True, "notDeployed": True}
+
+    counts = {"SUCCEEDED": 0, "RUNNING": 0, "FAILED": 0, "PENDING": 0}
+    failed_accounts = []
+
+    for s in summaries:
+        detail = s.get("StackInstanceStatus", {}).get("DetailedStatus", "UNKNOWN")
+        if detail == "SUCCEEDED":
+            counts["SUCCEEDED"] += 1
+        elif detail in ("RUNNING",):
+            counts["RUNNING"] += 1
+        elif detail in ("FAILED", "INOPERABLE", "FAILED_IMPORT", "CANCELLED"):
+            counts["FAILED"] += 1
+            acct = s.get("Account")
+            if acct:
+                failed_accounts.append(acct)
+        else:
+            counts["PENDING"] += 1
+
+    total = len(summaries)
+
+    if counts["RUNNING"] > 0:
+        return {
+            "status": "RUNNING",
+            "totalInstances": total,
+            "succeeded": counts["SUCCEEDED"],
+            "running": counts["RUNNING"],
+            "failed": counts["FAILED"],
+            "pending": counts["PENDING"],
+        }
+
+    if counts["FAILED"] == 0 and counts["SUCCEEDED"] == total:
+        return {"alreadyDeployed": True, "succeeded": total, "total": total}
+
+    return {
+        "status": "FAILED",
+        "totalInstances": total,
+        "succeeded": counts["SUCCEEDED"],
+        "failed": counts["FAILED"],
+        "pending": counts["PENDING"],
+        "failedAccounts": failed_accounts,
+    }
+
+
 def filter_eligible_plans_response(api_response):
     """
     Extracts minimal, LLM-friendly plan details from the eligible plans API response.
