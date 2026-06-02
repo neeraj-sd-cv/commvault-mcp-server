@@ -13,8 +13,8 @@ argument-hint: 'delegated admin AWS account ID (optional)'
 
 ## Tools Available (via MCP)
 - `get_aws_permissions_cft` — fetches CFT template URL and IAM role/user ARN details
-- `deploy_commvault_access_cft` — deploys the Commvault cross-account IAM role CFT stack via boto3
-- `get_commvault_access_cft_status` — polls the status of the access role CFT stack
+- `get_access_role_setup_steps` — returns browser quick-create URL and AWS CLI commands to deploy the Commvault access-role CFT (no AWS credentials required on the server)
+- `get_member_discovery_setup_steps` — returns browser console steps and AWS CLI commands to deploy the CommvaultMemberAccountDiscovery StackSet (no AWS credentials required on the server)
 - `validate_aws_cloud_credentials` — validates Commvault can assume the IAM role
 - `browse_aws_cloud_accounts` — confirms account discovery through the IAM role
 - `create_aws_cloud_connection` — creates the final cloud connection
@@ -25,10 +25,6 @@ argument-hint: 'delegated admin AWS account ID (optional)'
 - `create_server_plan` — creates a new server plan backed by the storage pool
 - `create_aws_protection_group` — creates the protection group
 - `start_aws_protection_group_backup` — starts an initial backup for the created protection group
-- `list_org_units` — lists AWS Organizational Units under a given parent (pass `"root"` for top-level OUs)
-- `check_member_stackset_status` — checks whether `CommvaultMemberAccountDiscovery` StackSet is deployed to an OU
-- `deploy_member_account_stackset` — creates/updates and deploys the StackSet to a target OU
-- `get_stackset_deployment_status` — polls the progress of an active StackSet deployment operation
 
 ---
 
@@ -80,60 +76,59 @@ If the user has not provided it, ask:
 Call `get_aws_permissions_cft` with the account ID.
 
 Retain internally (never show to user):
-- `connectionTypes.organization.cftQuickCreateUrl` → the CFT S3 template URL
+- `connectionTypes.organization.cftQuickCreateUrl` → browser quick-create URL
 - `connectionTypes.organization.iamRoleArn` → the hosted-infra IAM role ARN
 - `connectionTypes.organization.externalId` → the external ID
-- `memberAccountSetup.templateUrl` → the StackSet template URL (used later in Step 4)
+- `connectionTypes.organization.memberAccountSetup.templateUrl` → StackSet template URL (used later in Step 4)
+- `connectionTypes.organization.memberAccountSetup.hostedInfraRoleArn` → StackSet role ARN (Step 4)
+- `connectionTypes.organization.memberAccountSetup.hostedInfraUserArn` → StackSet user ARN (Step 4)
 
-#### Step 2a — Check and deploy
+#### Step 2a — Get setup steps
 
-Call `deploy_commvault_access_cft` with:
-- `template_url` = `connectionTypes.organization.cftQuickCreateUrl`
+Call `get_access_role_setup_steps` with:
+- `quick_create_url` = `connectionTypes.organization.cftQuickCreateUrl`
 - `infra_role_arn` = `connectionTypes.organization.iamRoleArn`
 - `external_id` = `connectionTypes.organization.externalId`
 
-**If `alreadyDeployed: true`:**
+The tool returns a `browserUrl` and a `cliCommands` list.
 
-> **Connect AWS — Already set up**
-> The Commvault access role is already deployed. Let's validate connectivity.
+#### Step 2b — Execute the setup
 
-Skip to Step 3.
+The agent always executes the CLI commands directly. Show the commands to the user before running them, then execute immediately — do not wait for user confirmation.
 
-**If `inProgress: true`:**
+Inform the user of the optional manual alternative before executing:
 
-> **Connect AWS — In progress**
-> A stack deployment is already running. I'll monitor it for you.
+> **Connect AWS — Working…**
+> Running the following AWS CLI commands to deploy the access role. If you prefer to do this manually instead, you can use this link in your AWS Console (sign in as the delegated admin account) and click **Create stack**: [Open CloudFormation quick-create]({browserUrl})
+>
+> ```
+> {cliCommands[0]}
+> {cliCommands[1]}
+> ```
 
-Proceed to Step 2b.
+Run `cliCommands[0]` (create-stack). Then poll using `cliCommands[1]` (describe-stacks) every 15 seconds until the output shows `CREATE_COMPLETE`.
 
-**If `success: true`:**
+Show progress while polling:
+> ⏳ Setting up access role… ({current status})
 
-> **Connect AWS — Deploying**
-> Setting up the Commvault access role in your AWS account. I'll check back in a moment.
-
-Proceed to Step 2b.
-
-**If `error` is present:** Say what went wrong in plain language and ask the user to verify their AWS CLI credentials are configured for the delegated admin account, then retry.
-
-#### Step 2b — Poll until the stack is ready
-
-Repeat until terminal:
-
-1. Wait ~15 seconds.
-2. Call `get_commvault_access_cft_status`.
-3. Show a brief status line: `⏳ Setting up access role… ({status})`
-
-On `done: true` (CREATE_COMPLETE):
+On `CREATE_COMPLETE`:
 
 > **Connect AWS — Done**
 > The Commvault access role has been deployed. Let's validate connectivity.
 
 Proceed to Step 3.
 
-On `failed: true`:
+On `CREATE_FAILED` / `ROLLBACK_COMPLETE`:
 
-> **Connect AWS — Failed**
-> The access role deployment failed. Please check that your AWS CLI credentials have permission to create IAM roles and CloudFormation stacks, then let me know to retry.
+> **Connect AWS — Needs attention**
+> The access role stack failed to deploy. Please check that you are signed in to the AWS CLI as the delegated admin account (your session may have expired or the wrong profile may be active), then let me know to retry.
+
+Stop and wait for user to resolve before retrying from Step 2a.
+
+On any AWS CLI command error (e.g. authentication error, access denied, no credentials):
+
+> **Connect AWS — Needs attention**
+> The AWS CLI command failed. Please check that you are signed in to the AWS CLI as the delegated admin account (your session may have expired), then let me know to retry.
 
 Stop and wait for user to resolve before retrying from Step 2a.
 
@@ -151,100 +146,72 @@ On success:
 On failure:
 
 > **Validate Access — Needs attention**
-> Commvault could not assume the IAM role yet. Please verify the access role stack status is **CREATE_COMPLETE** in CloudFormation, then let me know and I'll retry.
+> Commvault could not assume the IAM role yet. Please verify the access role stack status is **CREATE_COMPLETE** in CloudFormation (an expired or incorrect AWS CLI session during Step 2 could also cause this), then let me know and I'll retry.
 
 ---
 
 ### Step 4 — Set up member account discovery (StackSet)
 
-The goal is to deploy `CommvaultMemberAccountDiscovery` to the accounts inside the default Organizational Unit `ou-anxa-qikxlrp2`. This step is **idempotent**: if the StackSet is already healthy for that OU it is skipped entirely.
+The goal is to deploy `CommvaultMemberAccountDiscovery` to the accounts inside the default Organizational Unit `ou-anxa-qikxlrp2`. Use `ou-anxa-qikxlrp2` as the target OU unless the user explicitly provides a different OU ID.
 
-Use values retained from Step 2's `memberAccountSetup`:
-- `templateUrl` → `template_url`
-- `hostedInfraRoleArn` → `infra_role_arn`
-- `hostedInfraUserArn` → `infra_user_arn`
+#### Step 4a — Get setup steps
 
-#### Step 4a — Use the default target OU
+Call `get_member_discovery_setup_steps` with values retained from Step 2:
+- `template_url` = `connectionTypes.organization.memberAccountSetup.templateUrl`
+- `infra_role_arn` = `connectionTypes.organization.memberAccountSetup.hostedInfraRoleArn`
+- `infra_user_arn` = `connectionTypes.organization.memberAccountSetup.hostedInfraUserArn`
+- `target_ou_id` = `"ou-anxa-qikxlrp2"` (or the user-provided OU)
+- `region` = `"us-east-1"` (default)
 
-Use `ou-anxa-qikxlrp2` as the target OU unless the user explicitly provides a different OU ID.
+The tool returns `browserSteps` and a `cliCommands` list.
 
 ---
 
-#### Step 4b — Check whether the StackSet is already deployed
+#### Step 4b — Execute the setup
 
-Call `check_member_stackset_status` with `target_ou_id = "ou-anxa-qikxlrp2"` unless the user provided a different OU.
+The agent always executes the CLI commands directly. Show the commands to the user before running them, then execute immediately — do not wait for user confirmation.
 
-**Case 1 — `alreadyDeployed: true`**
+Inform the user of the optional manual alternative before executing:
 
-> **Discover Accounts — Already set up**
-> The Commvault member-account StackSet is already deployed across **{succeeded}** account(s) in that OU. No action needed.
-
-Skip to Step 5.
-
-**Case 2 — `notDeployed: true`**
-
-Proceed to Step 4c.
-
-**Case 3 — `status: "RUNNING"`**
-
-> **Discover Accounts — In progress**
-> A StackSet deployment is already running ({succeeded} done, {running} in progress, {failed} failed). I'll monitor it for you.
-
-Jump to the polling loop in Step 4d.
-
-**Case 4 — `status: "FAILED"`**
-
-> **Discover Accounts — Previous deployment had errors**
-> The last deployment left **{failed}** failed instance(s) ({failedAccounts}).
+> **Discover Accounts — Working…**
+> Running the following AWS CLI commands to deploy the member-account discovery StackSet. If you prefer to do this manually instead, here are the steps to follow in your AWS Console:
 >
-> I'll retry the deployment now.
+> {browserSteps}
+>
+> Otherwise, I'll run these commands now:
+>
+> ```
+> {cliCommands[1]}
+> {cliCommands[2]}
+> {cliCommands[3]}
+> ```
 
-Proceed directly to Step 4c.
+Run the commands from `cliCommands` in order:
+1. Run `cliCommands[1]` (create-stack-set). If the error indicates the StackSet already exists, skip to step 2.
+2. Run `cliCommands[2]` (create-stack-instances).
+3. Poll using `cliCommands[3]` (list-stack-instances) every 30 seconds.
 
----
+Show progress while polling:
+> ⏳ Deploying… checking instance status across member accounts…
 
-#### Step 4c — Deploy the StackSet
+On all instances showing `SUCCEEDED`:
 
-Call `deploy_member_account_stackset` with:
-- `target_ou_id` = `"ou-anxa-qikxlrp2"` unless the user provided a different OU
-- `template_url` = `memberAccountSetup.templateUrl` from Step 2
-- `infra_role_arn` = `memberAccountSetup.hostedInfraRoleArn` from Step 2
-- `infra_user_arn` = `memberAccountSetup.hostedInfraUserArn` from Step 2
-- `deployment_region` = `"us-east-1"` (default)
-
-On success:
-> **Discover Accounts — Deploying**
-> StackSet deployment started. I'll monitor progress every 30 seconds.
-
-Proceed to Step 4d.
-
-On error: Say what went wrong in plain language, verify AWS CLI credentials have `cloudformation:*` permissions, and wait for the user to confirm before retrying from Step 4c.
-
----
-
-#### Step 4d — Monitor deployment progress (polling loop)
-
-Repeat until `status` is `SUCCEEDED`, `FAILED`, or `STOPPED`:
-
-1. Wait ~30 seconds.
-2. Call `get_stackset_deployment_status` with the `operationId` from Step 4c.
-3. Display a compact progress update:
-   > ⏳ Deploying… {succeeded} succeeded · {running} running · {failed} failed · {pending} pending
-
-On `status: "SUCCEEDED"`:
 > **Discover Accounts — Done**
-> StackSet deployed successfully to all **{succeeded}** account(s) in the OU.
+> StackSet deployed successfully across all member accounts in the OU.
 
-On `status: "FAILED"`:
+On any instances showing `FAILED`:
+
 > **Discover Accounts — Completed with errors**
-> Deployment finished: **{succeeded}** succeeded, **{failed}** failed.
-> Failed accounts: {failedAccounts}
->
-> You can retry or continue — Commvault will still discover accounts where the stack succeeded.
+> Some accounts failed deployment. You can retry or continue — Commvault will still discover accounts where the stack succeeded.
 
-On `status: "STOPPED"`:
-> **Discover Accounts — Stopped**
-> The deployment was stopped before completion. Would you like me to retry?
+On any AWS CLI command error (e.g. authentication error, access denied, no credentials):
+
+> **Discover Accounts — Needs attention**
+> The AWS CLI command failed. Please check that you are signed in to the AWS CLI as the delegated admin account (your session may have expired), then let me know to retry.
+
+Stop and wait for user to resolve before retrying from Step 4a.
+
+If the user needs to find their OU ID, run the optional OU-discovery commands from `cliCommands[4]` and present the results as a plain list.
 
 After any terminal state, continue to Step 5.
 
@@ -290,6 +257,21 @@ If `summary.discoveryJobUrl` is absent, omit the tracking link:
 > The cloud connection **{summary.connectionName}** has been created and account discovery has started.
 
 Immediately continue to the protection group steps — do not ask the user if they want one.
+
+On failure, silently call `list_aws_cloud_connections` and scan the results for a connection whose name matches the one just attempted.
+
+If a name match is found:
+
+> **Create Connection — Needs attention**
+> The connection could not be created because a connection named **{name}** already exists. Would you like to use the existing connection, or choose a different name?
+
+- User says use existing → retain that connection's `connectionId`, `companyId`, and `companyName` internally and continue to Step 7.
+- User wants a different name → ask "What name would you like?" and retry `create_aws_cloud_connection` with the new name.
+
+If no name match is found:
+
+> **Create Connection — Needs attention**
+> The connection could not be created. Please check that your Commvault account has permission to create cloud connections, then let me know and I'll retry.
 
 ---
 
@@ -412,7 +394,7 @@ Do not say anything to the user while this call is in progress.
 
 On failure:
 > **Create Plan — Needs attention**
-> I wasn't able to create the storage pool. Please check that your Commvault account has permission to create storage, then let me know and I'll retry.
+> I wasn't able to create the storage pool. This can happen if a storage pool named **{storageName}** already exists. Please check the Commvault console and let me know to retry (or confirm it's safe to proceed with a different name).
 
 Do not proceed to plan creation if storage creation fails.
 
@@ -432,7 +414,18 @@ On success, show a single status line:
 
 Retain the `planId` internally. Continue to Step 9.
 
-On failure:
+On failure, silently call `list_eligible_plans` and scan the results for a plan whose name matches the one just attempted.
+
+If a name match is found:
+
+> **Create Plan — Needs attention**
+> A plan named **{planName}** already exists. Would you like to use that plan instead, or choose a different name for the new one?
+
+- User says use existing → retain that plan's `planId` and `planName` internally and continue to Step 9.
+- User wants a different name → ask "What name would you like?" and retry `create_server_plan` with the new name, reusing the storage pool already created in Step 8c.
+
+If no name match is found:
+
 > **Create Plan — Needs attention**
 > The plan could not be created. Note: the storage pool **{storageName}** was created and will need to be deleted in the Commvault console if you do not retry.
 
@@ -455,6 +448,11 @@ On success, say:
 > The protection group **{name}** is now active and protecting your selected workloads.
 
 Retain the protection group ID from the response internally. Continue immediately to Step 10 — do not ask the user if they want to start a backup.
+
+On failure:
+
+> **Create Protection Group — Needs attention**
+> The protection group could not be created. This can happen if a protection group named **{name}** already exists. Please check the Commvault console and, if it does, let me know to continue with the existing group or choose a different name and retry.
 
 ---
 

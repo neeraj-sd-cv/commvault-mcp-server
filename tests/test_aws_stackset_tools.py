@@ -1,22 +1,21 @@
-"""Unit and MCP-level tests for the StackSet / Organizations tools."""
+"""Unit and MCP-level tests for the stateless AWS setup-step tools and wrappers."""
 
 from fastmcp import Client
 import json
 import pytest
-from unittest.mock import patch, MagicMock, call
-from botocore.exceptions import ClientError, NoCredentialsError
 
 from src.wrappers import (
     filter_org_units_response,
     filter_stackset_status_response,
     filter_member_stackset_check,
+    parse_cft_quick_create_params,
 )
 from src.tools.aws_cloud_tools import (
-    list_org_units,
-    check_member_stackset_status,
-    deploy_member_account_stackset,
-    get_stackset_deployment_status,
+    get_access_role_setup_steps,
+    get_member_discovery_setup_steps,
     _STACKSET_NAME,
+    _DEFAULT_TARGET_OU_ID,
+    _ACCESS_STACK_NAME,
 )
 
 
@@ -37,6 +36,56 @@ def extract_response_data(result):
         return json.loads(content_list[0].text)
     except json.JSONDecodeError:
         return content_list[0].text
+
+
+# ---------------------------------------------------------------------------
+# Wrapper unit tests — parse_cft_quick_create_params
+# ---------------------------------------------------------------------------
+
+class TestParseCftQuickCreateParams:
+    _BASE = (
+        "https://us-east-1.console.aws.amazon.com/cloudformation/home"
+        "?region=us-east-1"
+        "#/stacks/create/review"
+        "?templateURL=https%3A%2F%2Fs3.amazonaws.com%2Fbucket%2Ftemplate.yaml"
+        "&stackName=CommvaultPermissionsStack"
+        "&param_HostedInfraRoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2FMetallic"
+        "&param_ExternalId=ext-abc-123"
+    )
+
+    def test_extracts_template_url(self):
+        result = parse_cft_quick_create_params(self._BASE)
+        assert result["templateUrl"] == "https://s3.amazonaws.com/bucket/template.yaml"
+
+    def test_extracts_stack_name(self):
+        result = parse_cft_quick_create_params(self._BASE)
+        assert result["stackName"] == "CommvaultPermissionsStack"
+
+    def test_extracts_params(self):
+        result = parse_cft_quick_create_params(self._BASE)
+        param_keys = {p["ParameterKey"] for p in result["params"]}
+        assert "HostedInfraRoleArn" in param_keys
+        assert "ExternalId" in param_keys
+
+    def test_param_values_decoded(self):
+        result = parse_cft_quick_create_params(self._BASE)
+        role_param = next(p for p in result["params"] if p["ParameterKey"] == "HostedInfraRoleArn")
+        assert role_param["ParameterValue"] == "arn:aws:iam::123456789012:role/Metallic"
+
+    def test_no_params_in_url(self):
+        url = (
+            "https://console.aws.amazon.com/cloudformation/home?region=us-east-1"
+            "#/stacks/create/review?templateURL=https%3A%2F%2Fs3.amazonaws.com%2Ft.yaml"
+            "&stackName=MyStack"
+        )
+        result = parse_cft_quick_create_params(url)
+        assert result["templateUrl"] == "https://s3.amazonaws.com/t.yaml"
+        assert result["params"] == []
+
+    def test_malformed_url_returns_defaults(self):
+        result = parse_cft_quick_create_params("not-a-valid-url")
+        assert result["stackName"] == "CommvaultPermissionsStack"
+        assert isinstance(result["params"], list)
 
 
 # ---------------------------------------------------------------------------
@@ -153,346 +202,230 @@ class TestFilterMemberStacksetCheck:
 
 
 # ---------------------------------------------------------------------------
-# Tool unit tests (mocked boto3) — list_org_units
+# Unit tests — get_access_role_setup_steps
 # ---------------------------------------------------------------------------
 
-class TestListOrgUnits:
-    def _paginator_mock(self, pages):
-        paginator = MagicMock()
-        paginator.paginate.return_value = pages
-        return paginator
-
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_resolves_root_string(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
-        client.list_roots.return_value = {"Roots": [{"Id": "r-0001"}]}
-        client.get_paginator.return_value = self._paginator_mock([
-            {"OrganizationalUnits": [{"Id": "ou-abc-1", "Name": "Dev"}]}
-        ])
-
-        result = list_org_units("root")
-        assert result["totalOUs"] == 1
-        assert result["ous"][0]["ouId"] == "ou-abc-1"
-        client.get_paginator.assert_called_with("list_organizational_units_for_parent")
-
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_passes_real_parent_id(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
-        client.get_paginator.return_value = self._paginator_mock([
-            {"OrganizationalUnits": []}
-        ])
-
-        result = list_org_units("r-0001")
-        assert result["totalOUs"] == 0
-        client.list_roots.assert_not_called()
-
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_no_credentials_returns_error(self, mock_boto):
-        mock_boto.side_effect = NoCredentialsError()
-        result = list_org_units("root")
-        assert "error" in result
-
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_client_error_returns_error(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
-        client.list_roots.side_effect = ClientError(
-            {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}}, "ListRoots"
-        )
-        result = list_org_units("root")
-        assert "error" in result
+_QUICK_CREATE_URL = (
+    "https://us-east-1.console.aws.amazon.com/cloudformation/home"
+    "?region=us-east-1"
+    "#/stacks/create/review"
+    "?templateURL=https%3A%2F%2Fs3.amazonaws.com%2Fbucket%2Ftemplate.yaml"
+    "&stackName=CommvaultPermissionsStack"
+    "&param_HostedInfraRoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2FMetallic"
+    "&param_ExternalId=ext-abc"
+)
+_INFRA_ROLE_ARN = "arn:aws:iam::123456789012:role/MetallicInfrastructureRole"
+_EXTERNAL_ID = "ext-abc-123"
 
 
-# ---------------------------------------------------------------------------
-# Tool unit tests — check_member_stackset_status
-# ---------------------------------------------------------------------------
-
-class TestCheckMemberStacksetStatus:
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_stackset_not_found(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
-        client.describe_stack_set.side_effect = ClientError(
-            {"Error": {"Code": "StackSetNotFoundException", "Message": "Not found"}},
-            "DescribeStackSet",
-        )
-        result = check_member_stackset_status("ou-x-1")
-        assert result.get("exists") is False
-
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_already_deployed(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
-        client.describe_stack_set.return_value = {}  # exists
-        client.get_paginator.return_value.paginate.return_value = [
-            {
-                "Summaries": [
-                    {
-                        "OrganizationalUnitId": "ou-x-1",
-                        "StackInstanceStatus": {"DetailedStatus": "SUCCEEDED"},
-                        "Account": "111111111111",
-                    }
-                ]
-            }
-        ]
-        result = check_member_stackset_status("ou-x-1")
-        assert result.get("alreadyDeployed") is True
-
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_no_credentials_returns_error(self, mock_boto):
-        mock_boto.side_effect = NoCredentialsError()
-        result = check_member_stackset_status("ou-x-1")
-        assert "error" in result
-
-
-# ---------------------------------------------------------------------------
-# Tool unit tests — deploy_member_account_stackset
-# ---------------------------------------------------------------------------
-
-class TestDeployMemberAccountStackset:
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_creates_new_stackset_and_instances(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
-
-        client.get_template_summary.return_value = {
-            "Parameters": [
-                {"ParameterKey": "HostedInfraRoleArn"},
-                {"ParameterKey": "HostedInfraUserArn"},
-            ]
-        }
-        client.describe_stack_set.side_effect = ClientError(
-            {"Error": {"Code": "StackSetNotFoundException", "Message": "Not found"}},
-            "DescribeStackSet",
-        )
-        client.create_stack_instances.return_value = {"OperationId": "op-abc-123"}
-        client.describe_stack_set_operation.return_value = {
-            "StackSetOperation": {"Status": "SUCCEEDED"}
-        }
-        client.get_paginator.return_value.paginate.return_value = [
-            {
-                "Summaries": [
-                    {
-                        "Account": "111",
-                        "StackInstanceStatus": {"DetailedStatus": "SUCCEEDED"},
-                    }
-                ]
-            }
-        ]
-
-        result = deploy_member_account_stackset(
-            target_ou_id="ou-x-1",
-            template_url="https://s3.amazonaws.com/bucket/template.yaml",
-            infra_role_arn="arn:aws:iam::123456789012:role/MetallicInfrastructureRole",
-            infra_user_arn="arn:aws:iam::123456789012:user/CommvaultAssumeRoleUser",
+class TestGetAccessRoleSetupSteps:
+    def _result(self, **kwargs):
+        return get_access_role_setup_steps(
+            quick_create_url=kwargs.get("quick_create_url", _QUICK_CREATE_URL),
+            infra_role_arn=kwargs.get("infra_role_arn", _INFRA_ROLE_ARN),
+            external_id=kwargs.get("external_id", _EXTERNAL_ID),
         )
 
-        assert result["success"] is True
-        assert result["operationId"] == "op-abc-123"
-        assert result["targetOuId"] == "ou-x-1"
-        client.create_stack_set.assert_called_once()
-        client.create_stack_instances.assert_called_once()
+    def test_returns_browser_url(self):
+        result = self._result()
+        assert result["browserUrl"] == _QUICK_CREATE_URL
 
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_updates_existing_stackset(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
+    def test_returns_browser_instructions(self):
+        result = self._result()
+        assert "browserInstructions" in result
+        assert "AWS Console" in result["browserInstructions"]
 
-        client.get_template_summary.return_value = {"Parameters": []}
-        client.describe_stack_set.return_value = {
-            "StackSet": {"PermissionModel": "SERVICE_MANAGED"}
-        }
-        client.create_stack_instances.return_value = {"OperationId": "op-xyz-456"}
-        client.describe_stack_set_operation.return_value = {
-            "StackSetOperation": {"Status": "SUCCEEDED"}
-        }
-        client.get_paginator.return_value.paginate.return_value = [
-            {
-                "Summaries": [
-                    {
-                        "Account": "111",
-                        "StackInstanceStatus": {"DetailedStatus": "SUCCEEDED"},
-                    }
-                ]
-            }
-        ]
+    def test_returns_cli_commands_list(self):
+        result = self._result()
+        assert isinstance(result["cliCommands"], list)
+        assert len(result["cliCommands"]) == 2
 
-        result = deploy_member_account_stackset(
-            target_ou_id="ou-x-1",
-            template_url="https://s3.amazonaws.com/bucket/template.yaml",
-            infra_role_arn="arn:aws:iam::123456789012:role/MetallicInfrastructureRole",
-            infra_user_arn="arn:aws:iam::123456789012:user/CommvaultAssumeRoleUser",
+    def test_create_stack_command_present(self):
+        result = self._result()
+        create_cmd = result["cliCommands"][0]["command"]
+        assert "aws cloudformation create-stack" in create_cmd
+        assert "CAPABILITY_NAMED_IAM" in create_cmd
+
+    def test_template_url_in_create_command(self):
+        result = self._result()
+        create_cmd = result["cliCommands"][0]["command"]
+        assert "s3.amazonaws.com/bucket/template.yaml" in create_cmd
+
+    def test_status_check_command_present(self):
+        result = self._result()
+        status_cmd = result["cliCommands"][1]["command"]
+        assert "describe-stacks" in status_cmd
+        assert "StackStatus" in status_cmd
+
+    def test_stack_name_in_commands(self):
+        result = self._result()
+        for entry in result["cliCommands"]:
+            assert _ACCESS_STACK_NAME in entry["command"]
+
+    def test_returns_notes(self):
+        result = self._result()
+        assert "notes" in result
+        assert "CREATE_COMPLETE" in result["notes"]
+
+    def test_no_boto3_calls(self):
+        # This should never raise a NoCredentialsError because no AWS SDK is used
+        result = self._result()
+        assert "error" not in result
+
+    def test_custom_region_and_stack_name(self):
+        result = get_access_role_setup_steps(
+            quick_create_url=_QUICK_CREATE_URL,
+            infra_role_arn=_INFRA_ROLE_ARN,
+            region="eu-west-1",
+            stack_name="MyCustomStack",
+        )
+        assert result["region"] == "eu-west-1"
+        assert result["stackName"] == "MyCustomStack"
+        assert "eu-west-1" in result["cliCommands"][0]["command"]
+        assert "MyCustomStack" in result["cliCommands"][0]["command"]
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — get_member_discovery_setup_steps
+# ---------------------------------------------------------------------------
+
+_TEMPLATE_URL = "https://s3.amazonaws.com/bucket/member-template.yaml"
+_MEMBER_ROLE_ARN = "arn:aws:iam::123456789012:role/MetallicInfrastructureRole"
+_MEMBER_USER_ARN = "arn:aws:iam::123456789012:user/CommvaultAssumeRoleUser"
+
+
+class TestGetMemberDiscoverySetupSteps:
+    def _result(self, **kwargs):
+        return get_member_discovery_setup_steps(
+            template_url=kwargs.get("template_url", _TEMPLATE_URL),
+            infra_role_arn=kwargs.get("infra_role_arn", _MEMBER_ROLE_ARN),
+            infra_user_arn=kwargs.get("infra_user_arn", _MEMBER_USER_ARN),
         )
 
-        assert result["success"] is True
-        client.update_stack_set.assert_called_once()
-        client.create_stack_set.assert_not_called()
+    def test_returns_browser_steps(self):
+        result = self._result()
+        assert "browserSteps" in result
+        assert "StackSet" in result["browserSteps"]
 
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_no_credentials_returns_error(self, mock_boto):
-        mock_boto.side_effect = NoCredentialsError()
-        result = deploy_member_account_stackset(
-            target_ou_id="ou-x-1",
-            template_url="https://s3.amazonaws.com/bucket/template.yaml",
-            infra_role_arn="arn:aws:iam::123456789012:role/MetallicInfrastructureRole",
-            infra_user_arn="arn:aws:iam::123456789012:user/CommvaultAssumeRoleUser",
+    def test_browser_steps_include_template_url(self):
+        result = self._result()
+        assert _TEMPLATE_URL in result["browserSteps"]
+
+    def test_browser_steps_include_role_arn(self):
+        result = self._result()
+        assert _MEMBER_ROLE_ARN in result["browserSteps"]
+
+    def test_returns_cli_commands_list(self):
+        result = self._result()
+        assert isinstance(result["cliCommands"], list)
+        assert len(result["cliCommands"]) == 5
+
+    def test_create_stackset_command_present(self):
+        result = self._result()
+        create_cmd = result["cliCommands"][1]["command"]
+        assert "create-stack-set" in create_cmd
+        assert "SERVICE_MANAGED" in create_cmd
+        assert "DELEGATED_ADMIN" in create_cmd
+
+    def test_create_stack_instances_command_present(self):
+        result = self._result()
+        instances_cmd = result["cliCommands"][2]["command"]
+        assert "create-stack-instances" in instances_cmd
+        assert _DEFAULT_TARGET_OU_ID in instances_cmd
+        assert "DELEGATED_ADMIN" in instances_cmd
+
+    def test_status_command_present(self):
+        result = self._result()
+        status_cmd = result["cliCommands"][3]["command"]
+        assert "list-stack-instances" in status_cmd
+        assert _STACKSET_NAME in status_cmd
+
+    def test_stackset_name_correct(self):
+        result = self._result()
+        assert result["stackSetName"] == _STACKSET_NAME
+
+    def test_default_ou_id(self):
+        result = self._result()
+        assert result["targetOuId"] == _DEFAULT_TARGET_OU_ID
+
+    def test_custom_ou_id(self):
+        result = get_member_discovery_setup_steps(
+            template_url=_TEMPLATE_URL,
+            infra_role_arn=_MEMBER_ROLE_ARN,
+            infra_user_arn=_MEMBER_USER_ARN,
+            target_ou_id="ou-custom-12345",
         )
-        assert "error" in result
+        assert result["targetOuId"] == "ou-custom-12345"
+        assert "ou-custom-12345" in result["cliCommands"][2]["command"]
+
+    def test_returns_notes(self):
+        result = self._result()
+        assert "notes" in result
+        assert "SUCCEEDED" in result["notes"]
+
+    def test_no_boto3_calls(self):
+        result = self._result()
+        assert "error" not in result
 
 
 # ---------------------------------------------------------------------------
-# Tool unit tests — get_stackset_deployment_status
-# ---------------------------------------------------------------------------
-
-class TestGetStacksetDeploymentStatus:
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_returns_status_summary(self, mock_boto):
-        client = MagicMock()
-        mock_boto.return_value = client
-
-        client.describe_stack_set_operation.return_value = {
-            "StackSetOperation": {"Status": "RUNNING"}
-        }
-        client.get_paginator.return_value.paginate.return_value = [
-            {
-                "Summaries": [
-                    {
-                        "StackInstanceStatus": {"DetailedStatus": "SUCCEEDED"},
-                        "Account": "111",
-                    },
-                    {
-                        "StackInstanceStatus": {"DetailedStatus": "RUNNING"},
-                        "Account": "222",
-                    },
-                ]
-            }
-        ]
-
-        result = get_stackset_deployment_status("op-abc-123")
-        assert result["status"] == "RUNNING"
-        assert result["succeeded"] == 1
-        assert result["running"] == 1
-
-    @patch("src.tools.aws_cloud_tools.boto3.client")
-    def test_no_credentials_returns_error(self, mock_boto):
-        mock_boto.side_effect = NoCredentialsError()
-        result = get_stackset_deployment_status("op-abc-123")
-        assert "error" in result
-
-
-# ---------------------------------------------------------------------------
-# MCP registration test
+# MCP registration tests
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_stackset_tools_registered(mcp_server):
+async def test_step_tools_registered(mcp_server):
     async with Client(mcp_server) as client:
         tools = await client.list_tools()
         tool_names = [t.name for t in tools]
-        assert "list_org_units" in tool_names
-        assert "check_member_stackset_status" in tool_names
-        assert "deploy_member_account_stackset" in tool_names
-        assert "get_stackset_deployment_status" in tool_names
+        assert "get_access_role_setup_steps" in tool_names
+        assert "get_member_discovery_setup_steps" in tool_names
+        # Confirm removed tools are gone
+        assert "deploy_commvault_access_cft" not in tool_names
+        assert "get_commvault_access_cft_status" not in tool_names
+        assert "list_org_units" not in tool_names
+        assert "check_member_stackset_status" not in tool_names
+        assert "deploy_member_account_stackset" not in tool_names
+        assert "get_stackset_deployment_status" not in tool_names
 
 
 # ---------------------------------------------------------------------------
-# MCP tool call tests (mocked boto3)
+# MCP tool call tests — new step tools (no AWS credentials needed)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_list_org_units_via_mcp(mcp_server):
-    """list_org_units returns a valid ous list via the MCP layer."""
-    with patch("src.tools.aws_cloud_tools.boto3.client") as mock_boto:
-        client_mock = MagicMock()
-        mock_boto.return_value = client_mock
-        client_mock.list_roots.return_value = {"Roots": [{"Id": "r-0001"}]}
-        client_mock.get_paginator.return_value.paginate.return_value = [
-            {"OrganizationalUnits": [{"Id": "ou-abc-1", "Name": "Production"}]}
-        ]
-
-        async with Client(mcp_server) as client:
-            result = await client.call_tool("list_org_units", {"parent_id": "root"})
-            data = extract_response_data(result)
-            assert "totalOUs" in data or "error" in data
-
-
-@pytest.mark.asyncio
-async def test_check_member_stackset_status_via_mcp(mcp_server):
-    """check_member_stackset_status returns exists:False when StackSet is absent."""
-    with patch("src.tools.aws_cloud_tools.boto3.client") as mock_boto:
-        client_mock = MagicMock()
-        mock_boto.return_value = client_mock
-        client_mock.describe_stack_set.side_effect = ClientError(
-            {"Error": {"Code": "StackSetNotFoundException", "Message": "nf"}},
-            "DescribeStackSet",
-        )
-
-        async with Client(mcp_server) as client:
-            result = await client.call_tool(
-                "check_member_stackset_status", {"target_ou_id": "ou-x-1"}
-            )
-            data = extract_response_data(result)
-            assert data.get("exists") is False or "error" in data
-
-
-@pytest.mark.asyncio
-async def test_deploy_member_account_stackset_via_mcp(mcp_server):
-    """deploy_member_account_stackset returns success:True via the MCP layer."""
-    with patch("src.tools.aws_cloud_tools.boto3.client") as mock_boto:
-        client_mock = MagicMock()
-        mock_boto.return_value = client_mock
-        client_mock.get_template_summary.return_value = {"Parameters": []}
-        client_mock.describe_stack_set.side_effect = ClientError(
-            {"Error": {"Code": "StackSetNotFoundException", "Message": "nf"}},
-            "DescribeStackSet",
-        )
-        client_mock.create_stack_instances.return_value = {"OperationId": "op-test-1"}
-        client_mock.describe_stack_set_operation.return_value = {
-            "StackSetOperation": {"Status": "SUCCEEDED"}
-        }
-        client_mock.get_paginator.return_value.paginate.return_value = [
+async def test_get_access_role_setup_steps_via_mcp(mcp_server):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_access_role_setup_steps",
             {
-                "Summaries": [
-                    {
-                        "Account": "111",
-                        "StackInstanceStatus": {"DetailedStatus": "SUCCEEDED"},
-                    }
-                ]
-            }
-        ]
-
-        async with Client(mcp_server) as client:
-            result = await client.call_tool(
-                "deploy_member_account_stackset",
-                {
-                    "target_ou_id": "ou-x-1",
-                    "template_url": "https://s3.amazonaws.com/bucket/tpl.yaml",
-                    "infra_role_arn": "arn:aws:iam::123456789012:role/MetallicInfrastructureRole",
-                    "infra_user_arn": "arn:aws:iam::123456789012:user/CommvaultAssumeRoleUser",
-                },
-            )
-            data = extract_response_data(result)
-            assert data.get("success") is True or "error" in data
+                "quick_create_url": _QUICK_CREATE_URL,
+                "infra_role_arn": _INFRA_ROLE_ARN,
+                "external_id": _EXTERNAL_ID,
+            },
+        )
+        data = extract_response_data(result)
+        assert "browserUrl" in data
+        assert "cliCommands" in data
+        assert isinstance(data["cliCommands"], list)
+        assert len(data["cliCommands"]) == 2
+        assert "aws cloudformation create-stack" in data["cliCommands"][0]["command"]
 
 
 @pytest.mark.asyncio
-async def test_get_stackset_deployment_status_via_mcp(mcp_server):
-    """get_stackset_deployment_status returns a status field via the MCP layer."""
-    with patch("src.tools.aws_cloud_tools.boto3.client") as mock_boto:
-        client_mock = MagicMock()
-        mock_boto.return_value = client_mock
-        client_mock.describe_stack_set_operation.return_value = {
-            "StackSetOperation": {"Status": "SUCCEEDED"}
-        }
-        client_mock.get_paginator.return_value.paginate.return_value = [
-            {"Summaries": [{"StackInstanceStatus": {"DetailedStatus": "SUCCEEDED"}, "Account": "111"}]}
-        ]
-
-        async with Client(mcp_server) as client:
-            result = await client.call_tool(
-                "get_stackset_deployment_status", {"operation_id": "op-test-1"}
-            )
-            data = extract_response_data(result)
-            assert "status" in data or "error" in data
+async def test_get_member_discovery_setup_steps_via_mcp(mcp_server):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "get_member_discovery_setup_steps",
+            {
+                "template_url": _TEMPLATE_URL,
+                "infra_role_arn": _MEMBER_ROLE_ARN,
+                "infra_user_arn": _MEMBER_USER_ARN,
+            },
+        )
+        data = extract_response_data(result)
+        assert "browserSteps" in data
+        assert "cliCommands" in data
+        assert isinstance(data["cliCommands"], list)
+        assert len(data["cliCommands"]) == 5
+        assert "create-stack-set" in data["cliCommands"][1]["command"]
+        assert "create-stack-instances" in data["cliCommands"][2]["command"]

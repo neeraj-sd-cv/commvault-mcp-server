@@ -20,29 +20,23 @@ from typing import Annotated, Dict, Any
 from pydantic import Field
 
 import json
-import time
+import subprocess
 
 from src.cv_api_client import commvault_api_client
 from src.logger import logger
 from src.utils import get_env_var
-import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
 
 from src.wrappers import (
     filter_aws_permissions_cft_response,
     filter_aws_cloud_connections_response,
     filter_aws_solutions_response,
     filter_eligible_plans_response,
-    filter_org_units_response,
-    filter_stackset_status_response,
-    filter_member_stackset_check,
+    parse_cft_quick_create_params,
 )
 
 
-_CFT_CONNECTION_TYPE_MAP = {
-    "ORGANIZATION": "organization",
-    "CLOUD_ACCOUNT": "account",
-}
+_STACKSET_NAME = "CommvaultMemberAccountDiscovery"
+_DEFAULT_TARGET_OU_ID = "ou-anxa-qikxlrp2"
 
 
 def _build_job_url(job_id) -> str | None:
@@ -75,24 +69,15 @@ def get_aws_permissions_cft(
         Field(description="The AWS account ID of the delegated admin account to onboard."),
     ],
 ) -> dict:
-    """Retrieve the CloudFormation Template (CFT) quick-create links and IAM role details
-    needed to set up Commvault permissions in the customer's AWS account.
+    """Fetch the CloudFormation quick-create links and IAM role details for AWS onboarding.
 
-    This is **step 1** of the AWS onboarding flow.
-
-    After calling this tool:
-    1. Immediately call ``deploy_commvault_access_cft`` using the values from this response:
-       - ``template_url``  → ``connectionTypes.organization.cftQuickCreateUrl``
-       - ``infra_role_arn`` → ``connectionTypes.organization.iamRoleArn``
-       - ``external_id``   → ``connectionTypes.organization.externalId``
-       Do NOT ask the user to open any URL manually — call the deploy tool directly.
-    2. Poll ``get_commvault_access_cft_status`` until the stack reaches CREATE_COMPLETE.
-    3. Call ``validate_aws_cloud_credentials`` to verify the setup.
-    4. Call ``deploy_member_account_stackset`` with:
-       - ``template_url``   → ``connectionTypes.organization.memberAccountSetup.templateUrl``
-       - ``infra_role_arn`` → ``connectionTypes.organization.memberAccountSetup.hostedInfraRoleArn``
-       - ``infra_user_arn`` → ``connectionTypes.organization.memberAccountSetup.hostedInfraUserArn``
-       Do not ask the user to deploy the StackSet manually.
+    Call this first, then:
+    1. Pass ``connectionTypes.organization`` values to ``get_access_role_setup_steps``
+       and follow those steps until the stack is CREATE_COMPLETE.
+    2. Call ``validate_aws_cloud_credentials`` to confirm Commvault can assume the role.
+    3. Pass ``connectionTypes.organization.memberAccountSetup`` values to
+       ``get_member_discovery_setup_steps`` and follow those steps until SUCCEEDED.
+    4. Call ``browse_aws_cloud_accounts`` to confirm account discovery.
     """
     try:
         response = commvault_api_client.get(
@@ -479,491 +464,272 @@ def start_aws_protection_group_backup(
         }
 
 
-_STACKSET_NAME = "CommvaultMemberAccountDiscovery"
+# ---------------------------------------------------------------------------
+# Stateless step-emitting tools (no AWS credentials required)
+# ---------------------------------------------------------------------------
+
 _ACCESS_STACK_NAME = "CommvaultPermissionsStack"
-_DEFAULT_TARGET_OU_ID = "ou-anxa-qikxlrp2"
-
-# Heuristic substrings used to match parameter keys discovered from the CFT
-_ROLE_ARN_HINTS = ("rolearn", "role_arn", "rolearn", "infrarolearn", "infrarole")
-_USER_ARN_HINTS = ("userarn", "user_arn", "infrauserarn", "infrauser")
-_EXTERNAL_ID_HINTS = ("externalid", "external_id", "extid")
-
-# ---------------------------------------------------------------------------
-# Initial access-role CFT helpers
-# ---------------------------------------------------------------------------
 
 
-def _match_param_key(keys: list[str], hints: tuple) -> str | None:
-    """Return the first key whose lowercased name contains any of the hint substrings."""
-    for key in keys:
-        lower = key.lower().replace("-", "").replace("_", "")
-        if any(h in lower for h in hints):
-            return key
-    return None
-
-
-def deploy_commvault_access_cft(
-    template_url: str,
-    infra_role_arn: str,
-    external_id: str = "",
-    stack_name: str = _ACCESS_STACK_NAME,
-    region: str = "us-east-1",
-) -> dict:
-    """Deploy the Commvault cross-account access role CloudFormation stack.
-
-    This creates the IAM role in the delegated admin account that allows
-    Commvault to access the AWS environment.  Idempotent: if the stack already
-    exists and is CREATE_COMPLETE it returns immediately.  Uses boto3 with the
-    current AWS CLI / environment credentials.
-
-    Args:
-        template_url: S3 URL of the CFT template from get_aws_permissions_cft.
-        infra_role_arn: Commvault hosted-infra IAM role ARN (from CFT response).
-        external_id: External ID value from get_aws_permissions_cft.
-        stack_name: CloudFormation stack name. Defaults to "CommvaultPermissionsStack".
-        region: AWS region to deploy into. Defaults to "us-east-1".
-    """
-    try:
-        cfn = boto3.client("cloudformation", region_name=region)
-
-        # Idempotency check
-        try:
-            desc = cfn.describe_stacks(StackName=stack_name)
-            existing = desc["Stacks"][0]
-            status = existing.get("StackStatus", "")
-            if status == "CREATE_COMPLETE":
-                return {
-                    "alreadyDeployed": True,
-                    "stackName": stack_name,
-                    "status": status,
-                    "message": "Access role stack is already deployed.",
-                }
-            if status in ("CREATE_IN_PROGRESS", "UPDATE_IN_PROGRESS"):
-                return {
-                    "inProgress": True,
-                    "stackName": stack_name,
-                    "status": status,
-                    "message": "A deployment is already in progress.",
-                }
-            if status in (
-                "ROLLBACK_COMPLETE", "CREATE_FAILED", "ROLLBACK_FAILED",
-                "UPDATE_ROLLBACK_COMPLETE", "DELETE_FAILED",
-            ):
-                return {
-                    "error": True,
-                    "stackName": stack_name,
-                    "status": status,
-                    "message": (
-                        f"Stack '{stack_name}' is in {status} state. "
-                        "Delete it manually in the AWS Console before retrying."
-                    ),
-                }
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "ValidationError":
-                raise
-
-        # Discover template parameter keys dynamically
-        summary = cfn.get_template_summary(TemplateURL=template_url)
-        param_keys = [p["ParameterKey"] for p in summary.get("Parameters", [])]
-
-        params = []
-        role_key = _match_param_key(param_keys, _ROLE_ARN_HINTS)
-        external_id_key = _match_param_key(param_keys, _EXTERNAL_ID_HINTS)
-        if role_key:
-            params.append({"ParameterKey": role_key, "ParameterValue": infra_role_arn})
-        if external_id_key:
-            params.append({"ParameterKey": external_id_key, "ParameterValue": external_id})
-
-        cfn.create_stack(
-            StackName=stack_name,
-            TemplateURL=template_url,
-            Parameters=params,
-            Capabilities=["CAPABILITY_NAMED_IAM"],
-            OnFailure="ROLLBACK",
-        )
-        return {
-            "success": True,
-            "stackName": stack_name,
-            "status": "CREATE_IN_PROGRESS",
-            "message": (
-                "Stack deployment started. "
-                "Use get_commvault_access_cft_status to monitor progress."
-            ),
-        }
-    except NoCredentialsError as e:
-        logger.error(f"deploy_commvault_access_cft error - no AWS credentials: {e}")
-        return {"error": "No AWS credentials found. Run 'aws configure' or set environment variables."}
-    except ClientError as e:
-        logger.error(f"deploy_commvault_access_cft error: {e}")
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"deploy_commvault_access_cft error: {e}")
-        return {"error": str(e)}
-
-
-def get_commvault_access_cft_status(
-    stack_name: str = _ACCESS_STACK_NAME,
-    region: str = "us-east-1",
-) -> dict:
-    """Poll the status of the Commvault access role CloudFormation stack.
-
-    Call repeatedly until ``status`` is ``CREATE_COMPLETE`` (success) or a
-    ``*_FAILED`` / ``ROLLBACK_*`` state (failure).
-
-    Args:
-        stack_name: CloudFormation stack name. Defaults to "CommvaultCloudAccess".
-        region: AWS region where the stack was deployed. Defaults to "us-east-1".
-    """
-    try:
-        cfn = boto3.client("cloudformation", region_name=region)
-        desc = cfn.describe_stacks(StackName=stack_name)
-        stack = desc["Stacks"][0]
-        status = stack.get("StackStatus", "UNKNOWN")
-        reason = stack.get("StackStatusReason", "")
-
-        terminal_ok = {"CREATE_COMPLETE", "UPDATE_COMPLETE"}
-        terminal_fail = {
-            "CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED",
-            "DELETE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE",
-        }
-
-        result: dict = {"stackName": stack_name, "status": status}
-        if status in terminal_ok:
-            result["done"] = True
-        elif status in terminal_fail:
-            result["failed"] = True
-            if reason:
-                result["reason"] = reason
-        return result
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ValidationError":
-            logger.error(f"get_commvault_access_cft_status error - stack not found: {e}")
-            return {"error": f"Stack '{stack_name}' not found."}
-        logger.error(f"get_commvault_access_cft_status error: {e}")
-        return {"error": str(e)}
-    except NoCredentialsError as e:
-        logger.error(f"get_commvault_access_cft_status error - no AWS credentials: {e}")
-        return {"error": "No AWS credentials found. Run 'aws configure' or set environment variables."}
-    except Exception as e:
-        logger.error(f"get_commvault_access_cft_status error: {e}")
-        return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# StackSet / Organizations helpers
-# ---------------------------------------------------------------------------
-
-
-def list_org_units(parent_id: str) -> dict:
-    """List AWS Organizational Units that are direct children of a parent node.
-
-    Args:
-        parent_id: The parent ID to list OUs under. Use "root" to list the
-            root-level OUs. The function automatically resolves the literal
-            string "root" to the actual root ID via
-            organizations.list_roots().  You can also pass a real parent ID
-            such as "r-xxxx" (root) or "ou-xxxx-yyyyyyyy" (OU).
-    """
-    try:
-        org = boto3.client("organizations")
-
-        if parent_id.strip().lower() == "root":
-            roots = org.list_roots().get("Roots", [])
-            if not roots:
-                return {"error": "No AWS Organization roots found."}
-            parent_id = roots[0]["Id"]
-
-        paginator = org.get_paginator("list_organizational_units_for_parent")
-        ous = []
-        for page in paginator.paginate(ParentId=parent_id):
-            ous.extend(page.get("OrganizationalUnits", []))
-
-        return filter_org_units_response({"OrganizationalUnits": ous})
-    except NoCredentialsError as e:
-        logger.error(f"list_org_units error - no AWS credentials: {e}")
-        return {"error": "No AWS credentials found. Run 'aws configure' or set environment variables."}
-    except ClientError as e:
-        logger.error(f"list_org_units error: {e}")
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"list_org_units error: {e}")
-        return {"error": str(e)}
-
-
-def check_member_stackset_status(
-    target_ou_id: str = _DEFAULT_TARGET_OU_ID,
-    call_as: str = "DELEGATED_ADMIN",
-) -> dict:
-    """Check whether the Commvault member-account StackSet is already deployed to an OU.
-
-    Returns one of three shapes:
-    - {"exists": False, "notDeployed": True}  – StackSet doesn't exist at all
-    - {"alreadyDeployed": True, ...}           – all instances in the OU SUCCEEDED
-    - {"status": "RUNNING"|"FAILED", ...}      – in-flight or needs attention
-
-    Args:
-        target_ou_id: The OU ID to check. Defaults to "ou-anxa-qikxlrp2".
-        call_as: StackSets caller context. Defaults to "DELEGATED_ADMIN";
-            use "SELF" only from the AWS Organization management account.
-    """
-    try:
-        cfn = boto3.client("cloudformation")
-        paginator = cfn.get_paginator("list_stack_instances")
-
-        # Check if the StackSet itself exists
-        try:
-            cfn.describe_stack_set(StackSetName=_STACKSET_NAME, CallAs=call_as)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "StackSetNotFoundException":
-                return filter_member_stackset_check(False, {}, target_ou_id)
-            raise
-
-        summaries = []
-        for page in paginator.paginate(StackSetName=_STACKSET_NAME, CallAs=call_as):
-            summaries.extend(page.get("Summaries", []))
-
-        return filter_member_stackset_check(True, {"Summaries": summaries}, target_ou_id)
-    except NoCredentialsError as e:
-        logger.error(f"check_member_stackset_status error - no AWS credentials: {e}")
-        return {"error": "No AWS credentials found. Run 'aws configure' or set environment variables."}
-    except ClientError as e:
-        logger.error(f"check_member_stackset_status error: {e}")
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"check_member_stackset_status error: {e}")
-        return {"error": str(e)}
-
-
-def deploy_member_account_stackset(
-    template_url: str,
-    infra_role_arn: str,
-    infra_user_arn: str,
-    target_ou_id: str = _DEFAULT_TARGET_OU_ID,
-    deployment_region: str = "us-east-1",
-    permission_model: str = "SERVICE_MANAGED",
-    call_as: str = "DELEGATED_ADMIN",
-    poll_interval_seconds: int = 15,
-    max_wait_seconds: int = 1800,
-) -> dict:
-    """Create (or update) and deploy the Commvault member-account discovery StackSet.
-
-    This is idempotent: if the StackSet already exists it is updated in-place;
-    if it does not exist it is created.  Stack instances are then deployed to
-    every account inside `target_ou_id`.
-
-    Args:
-        template_url: S3 URL to the CloudFormation template, from
-            get_aws_permissions_cft connectionTypes.organization.memberAccountSetup.templateUrl.
-        infra_role_arn: Commvault hosted-infra IAM role ARN, from
-            get_aws_permissions_cft connectionTypes.organization.memberAccountSetup.hostedInfraRoleArn.
-        infra_user_arn: Commvault hosted-infra IAM user ARN, from
-            get_aws_permissions_cft connectionTypes.organization.memberAccountSetup.hostedInfraUserArn.
-        target_ou_id: OU ID whose member accounts should receive the stack
-            instance. Defaults to "ou-anxa-qikxlrp2".
-        deployment_region: AWS region in which instances are deployed.
-            Defaults to "us-east-1".
-        permission_model: StackSet permission model. Defaults to "SERVICE_MANAGED",
-            which is required for OU-based targeting. The caller must run from
-            an AWS Organization management account or delegated StackSets
-            administrator.
-        call_as: StackSets caller context. Defaults to "DELEGATED_ADMIN";
-            use "SELF" only from the AWS Organization management account.
-        poll_interval_seconds: Seconds to wait between deployment status checks.
-            Defaults to 15.
-        max_wait_seconds: Maximum seconds to wait for the StackSet operation to
-            reach a terminal state. Defaults to 1800 (30 minutes).
-    """
-    try:
-        cfn = boto3.client("cloudformation")
-
-        # Discover the parameter keys expected by the template
-        template_summary = cfn.get_template_summary(TemplateURL=template_url)
-        param_keys = [p["ParameterKey"] for p in template_summary.get("Parameters", [])]
-
-        params = []
-        role_key = _match_param_key(param_keys, _ROLE_ARN_HINTS)
-        user_key = _match_param_key(param_keys, _USER_ARN_HINTS)
-        if role_key:
-            params.append({"ParameterKey": role_key, "ParameterValue": infra_role_arn})
-        if user_key:
-            params.append({"ParameterKey": user_key, "ParameterValue": infra_user_arn})
-
-        capabilities = ["CAPABILITY_NAMED_IAM"]
-        stackset_kwargs: Dict[str, Any] = {
-            "TemplateURL": template_url,
-            "Parameters": params,
-            "Capabilities": capabilities,
-            "PermissionModel": permission_model,
-        }
-        if permission_model == "SERVICE_MANAGED":
-            stackset_kwargs["AutoDeployment"] = {
-                "Enabled": True,
-                "RetainStacksOnAccountRemoval": False,
-            }
-
-        # Create or update the StackSet definition. AWS does not allow changing
-        # a StackSet's permission model after creation.
-        existing_perm_model = None
-        try:
-            desc = cfn.describe_stack_set(StackSetName=_STACKSET_NAME, CallAs=call_as)
-            existing_perm_model = desc["StackSet"].get("PermissionModel")
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "StackSetNotFoundException":
-                existing_perm_model = None
-            else:
-                raise
-
-        if existing_perm_model and existing_perm_model != permission_model:
-            return {
-                "error": True,
-                "stackSetName": _STACKSET_NAME,
-                "existingPermissionModel": existing_perm_model,
-                "requestedPermissionModel": permission_model,
-                "message": (
-                    f"StackSet '{_STACKSET_NAME}' exists with PermissionModel="
-                    f"{existing_perm_model}, but {permission_model} was requested. "
-                    "AWS does not allow changing the permission model. "
-                    "Delete the existing StackSet manually in the AWS Console and retry."
-                ),
-            }
-
-        stackset_exists = existing_perm_model is not None
-        if stackset_exists:
-            try:
-                cfn.update_stack_set(
-                    StackSetName=_STACKSET_NAME,
-                    CallAs=call_as,
-                    **stackset_kwargs,
-                )
-            except ClientError as e:
-                if e.response["Error"]["Code"] != "StackSetNotEmptyException":
-                    raise
-        else:
-            cfn.create_stack_set(
-                StackSetName=_STACKSET_NAME,
-                Description="Commvault member-account discovery role",
-                CallAs=call_as,
-                **stackset_kwargs,
+def get_access_role_setup_steps(
+    quick_create_url: Annotated[
+        str,
+        Field(
+            description=(
+                "The CFT quick-create URL from get_aws_permissions_cft "
+                "(connectionTypes.organization.cftQuickCreateUrl)."
             )
+        ),
+    ],
+    infra_role_arn: Annotated[
+        str,
+        Field(
+            description=(
+                "The Commvault hosted-infra IAM role ARN from get_aws_permissions_cft "
+                "(connectionTypes.organization.iamRoleArn)."
+            )
+        ),
+    ],
+    external_id: Annotated[
+        str,
+        Field(
+            description=(
+                "The external ID from get_aws_permissions_cft "
+                "(connectionTypes.organization.externalId)."
+            )
+        ),
+    ] = "",
+    region: Annotated[str, Field(description="AWS region. Defaults to us-east-1.")] = "us-east-1",
+    stack_name: Annotated[
+        str,
+        Field(description="CloudFormation stack name. Defaults to CommvaultPermissionsStack."),
+    ] = _ACCESS_STACK_NAME,
+) -> dict:
+    """Return the steps needed to deploy the Commvault cross-account access-role CFT.
 
-        # Deploy instances to the target OU
-        response = cfn.create_stack_instances(
-            StackSetName=_STACKSET_NAME,
-            CallAs=call_as,
-            DeploymentTargets={"OrganizationalUnitIds": [target_ou_id]},
-            Regions=[deployment_region],
-            OperationPreferences={
-                "RegionConcurrencyType": "PARALLEL",
-                "FailureTolerancePercentage": 100,
-                "MaxConcurrentPercentage": 100,
+    Returns a ``browserUrl`` the user can open in the AWS Console to create the stack
+    with one click, plus ``cliCommands`` the agent can run locally: a ``create-stack``
+    command and a ``describe-stacks`` status-check command.
+
+    Call ``validate_aws_cloud_credentials`` once the stack reaches CREATE_COMPLETE.
+    """
+    parsed = parse_cft_quick_create_params(quick_create_url)
+    template_url = parsed["templateUrl"] or quick_create_url
+
+    # Build --parameters string for the CLI command
+    params_parts = []
+    for p in parsed["params"]:
+        params_parts.append(f"ParameterKey={p['ParameterKey']},ParameterValue=\"{p['ParameterValue']}\"")
+    # Ensure the infra_role_arn and external_id are represented even if the
+    # quick-create URL did not embed them as param_ values
+    param_keys_present = {p["ParameterKey"].lower() for p in parsed["params"]}
+    if infra_role_arn and not any("role" in k for k in param_keys_present):
+        params_parts.append(f"ParameterKey=HostedInfraRoleArn,ParameterValue=\"{infra_role_arn}\"")
+    if external_id and not any("external" in k or "extid" in k for k in param_keys_present):
+        params_parts.append(f"ParameterKey=ExternalId,ParameterValue=\"{external_id}\"")
+
+    params_flag = ""
+    if params_parts:
+        params_flag = " \\\n  --parameters " + " \\\n              ".join(params_parts)
+
+    create_cmd = (
+        f"aws cloudformation create-stack \\\n"
+        f"  --stack-name {stack_name} \\\n"
+        f"  --template-url \"{template_url}\" \\\n"
+        f"  --capabilities CAPABILITY_NAMED_IAM \\\n"
+        f"  --on-failure ROLLBACK \\\n"
+        f"  --region {region}"
+        f"{params_flag}"
+    )
+
+    status_cmd = (
+        f"aws cloudformation describe-stacks \\\n"
+        f"  --stack-name {stack_name} \\\n"
+        f"  --region {region} \\\n"
+        f"  --query \"Stacks[0].StackStatus\" \\\n"
+        f"  --output text"
+    )
+
+    return {
+        "browserUrl": quick_create_url,
+        "browserInstructions": (
+            "Open the URL above in your AWS Console (make sure you are signed into the "
+            "delegated admin account). Review the pre-filled parameters and click "
+            "'Create stack'. Wait for the stack status to show CREATE_COMPLETE."
+        ),
+        "cliCommands": [
+            {
+                "description": "Create the Commvault access-role stack",
+                "command": create_cmd,
             },
-        )
-        operation_id = response.get("OperationId")
+            {
+                "description": "Poll stack status (run until CREATE_COMPLETE)",
+                "command": status_cmd,
+            },
+        ],
+        "stackName": stack_name,
+        "region": region,
+        "notes": (
+            "The stack creates an IAM role that allows Commvault to access your AWS account. "
+            "It typically takes 1–2 minutes to reach CREATE_COMPLETE. "
+            "Once complete, call validate_aws_cloud_credentials to confirm connectivity."
+        ),
+    }
 
-        terminal_statuses = {"SUCCEEDED", "FAILED", "STOPPED"}
-        deadline = time.time() + max_wait_seconds
-        final_status_payload: dict[str, Any] = {}
 
-        while True:
-            op_response = cfn.describe_stack_set_operation(
-                StackSetName=_STACKSET_NAME,
-                OperationId=operation_id,
-                CallAs=call_as,
+def get_member_discovery_setup_steps(
+    template_url: Annotated[
+        str,
+        Field(
+            description=(
+                "StackSet template S3 URL from get_aws_permissions_cft "
+                "(connectionTypes.organization.memberAccountSetup.templateUrl)."
             )
-
-            paginator = cfn.get_paginator("list_stack_instances")
-            summaries = []
-            for page in paginator.paginate(StackSetName=_STACKSET_NAME, CallAs=call_as):
-                summaries.extend(page.get("Summaries", []))
-
-            final_status_payload = filter_stackset_status_response(
-                op_response,
-                {"Summaries": summaries},
+        ),
+    ],
+    infra_role_arn: Annotated[
+        str,
+        Field(
+            description=(
+                "Commvault hosted-infra IAM role ARN from get_aws_permissions_cft "
+                "(connectionTypes.organization.memberAccountSetup.hostedInfraRoleArn)."
             )
-            status = final_status_payload.get("status")
-
-            if status in terminal_statuses:
-                break
-
-            if time.time() >= deadline:
-                final_status_payload["timedOut"] = True
-                break
-
-            time.sleep(poll_interval_seconds)
-
-        timed_out = final_status_payload.get("timedOut") is True
-        status = final_status_payload.get("status")
-
-        return {
-            "success": status == "SUCCEEDED",
-            "stackSetName": _STACKSET_NAME,
-            "operationId": operation_id,
-            "targetOuId": target_ou_id,
-            "region": deployment_region,
-            "finalStatus": final_status_payload,
-            "message": (
-                f"StackSet deployment finished with status={status}."
-                if not timed_out
-                else (
-                    f"StackSet deployment did not finish within {max_wait_seconds}s; "
-                    "call get_stackset_deployment_status with the operationId to keep polling."
-                )
-            ),
-        }
-    except NoCredentialsError as e:
-        logger.error(f"deploy_member_account_stackset error - no AWS credentials: {e}")
-        return {"error": "No AWS credentials found. Run 'aws configure' or set environment variables."}
-    except ClientError as e:
-        logger.error(f"deploy_member_account_stackset error: {e}")
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"deploy_member_account_stackset error: {e}")
-        return {"error": str(e)}
-
-
-def get_stackset_deployment_status(
-    operation_id: str,
-    call_as: str = "DELEGATED_ADMIN",
+        ),
+    ],
+    infra_user_arn: Annotated[
+        str,
+        Field(
+            description=(
+                "Commvault hosted-infra IAM user ARN from get_aws_permissions_cft "
+                "(connectionTypes.organization.memberAccountSetup.hostedInfraUserArn)."
+            )
+        ),
+    ],
+    target_ou_id: Annotated[
+        str,
+        Field(description="Target OU ID. Defaults to the standard Commvault default OU."),
+    ] = _DEFAULT_TARGET_OU_ID,
+    region: Annotated[
+        str,
+        Field(description="AWS region for stack instances. Defaults to us-east-1."),
+    ] = "us-east-1",
 ) -> dict:
-    """Poll the status of a running StackSet deployment operation.
+    """Return the steps needed to deploy the CommvaultMemberAccountDiscovery StackSet.
 
-    Call repeatedly until ``status`` is one of SUCCEEDED / FAILED / STOPPED.
+    Returns ``browserSteps`` the user can follow in the AWS Console, plus
+    ``cliCommands`` the agent can run locally: create the StackSet definition,
+    deploy instances to the target OU, and poll status.
 
-    Args:
-        operation_id: The operationId returned by deploy_member_account_stackset.
-        call_as: StackSets caller context. Defaults to "DELEGATED_ADMIN";
-            use "SELF" only from the AWS Organization management account.
+    Call ``browse_aws_cloud_accounts`` once all instances reach SUCCEEDED.
     """
-    try:
-        cfn = boto3.client("cloudformation")
+    stackset_name = _STACKSET_NAME
 
-        op_response = cfn.describe_stack_set_operation(
-            StackSetName=_STACKSET_NAME,
-            OperationId=operation_id,
-            CallAs=call_as,
-        )
+    discover_params_cmd = (
+        f"aws cloudformation get-template-summary \\\n"
+        f"  --template-url \"{template_url}\" \\\n"
+        f"  --query \"Parameters[].ParameterKey\" \\\n"
+        f"  --output text"
+    )
 
-        paginator = cfn.get_paginator("list_stack_instances")
-        summaries = []
-        for page in paginator.paginate(StackSetName=_STACKSET_NAME, CallAs=call_as):
-            summaries.extend(page.get("Summaries", []))
+    create_stackset_cmd = (
+        f"# Run cliCommands[0] first to confirm the actual parameter key names in this template.\n"
+        f"aws cloudformation create-stack-set \\\n"
+        f"  --stack-set-name {stackset_name} \\\n"
+        f"  --template-url \"{template_url}\" \\\n"
+        f"  --parameters "
+        f"ParameterKey=HostedInfraRoleArn,ParameterValue=\"{infra_role_arn}\" "
+        f"ParameterKey=HostedInfraUserArn,ParameterValue=\"{infra_user_arn}\" \\\n"
+        f"  --capabilities CAPABILITY_NAMED_IAM \\\n"
+        f"  --permission-model SERVICE_MANAGED \\\n"
+        f"  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \\\n"
+        f"  --call-as DELEGATED_ADMIN"
+    )
 
-        return filter_stackset_status_response(
-            op_response,
-            {"Summaries": summaries},
-        )
-    except NoCredentialsError as e:
-        logger.error(f"get_stackset_deployment_status error - no AWS credentials: {e}")
-        return {"error": "No AWS credentials found. Run 'aws configure' or set environment variables."}
-    except ClientError as e:
-        logger.error(f"get_stackset_deployment_status error: {e}")
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"get_stackset_deployment_status error: {e}")
-        return {"error": str(e)}
+    deploy_instances_cmd = (
+        f"aws cloudformation create-stack-instances \\\n"
+        f"  --stack-set-name {stackset_name} \\\n"
+        f"  --deployment-targets OrganizationalUnitIds={target_ou_id} \\\n"
+        f"  --regions {region} \\\n"
+        f"  --operation-preferences "
+        f"RegionConcurrencyType=PARALLEL,FailureTolerancePercentage=100,MaxConcurrentPercentage=100 \\\n"
+        f"  --call-as DELEGATED_ADMIN"
+    )
+
+    status_cmd = (
+        f"aws cloudformation list-stack-instances \\\n"
+        f"  --stack-set-name {stackset_name} \\\n"
+        f"  --call-as DELEGATED_ADMIN \\\n"
+        f"  --no-paginate \\\n"
+        f"  --query \"Summaries[?OrganizationalUnitId=='{target_ou_id}']"
+        f".[Account,StackInstanceStatus.DetailedStatus]\" \\\n"
+        f"  --output table"
+    )
+
+    discover_ou_cmd = (
+        "# Optional: list root OUs to find the correct target_ou_id\n"
+        "aws organizations list-roots --query \"Roots[0].Id\" --output text\n"
+        "# Then list child OUs (replace ROOT_ID with output above):\n"
+        "aws organizations list-organizational-units-for-parent \\\n"
+        "  --parent-id ROOT_ID \\\n"
+        "  --query \"OrganizationalUnits[].{Id:Id,Name:Name}\" \\\n"
+        "  --output table"
+    )
+
+    browser_steps = (
+        "Deploy CommvaultMemberAccountDiscovery StackSet via AWS Console:\n\n"
+        "1. Sign in to the delegated admin account and go to:\n"
+        "   https://console.aws.amazon.com/cloudformation/home#/stacksets/create\n"
+        "2. Under 'Permissions', select 'Service-managed permissions'.\n"
+        "3. Select 'Specify template' → 'Amazon S3 URL' and paste:\n"
+        f"   {template_url}\n"
+        "4. Click 'Next'. Under Parameters, enter:\n"
+        f"   - HostedInfraRoleArn: {infra_role_arn}\n"
+        f"   - HostedInfraUserArn: {infra_user_arn}\n"
+        "5. Click 'Next' through stack options. Under 'Deployment targets',\n"
+        "   select 'Deploy to organizational units (OUs)' and paste:\n"
+        f"   {target_ou_id}\n"
+        f"6. Select region: {region}. Click 'Next' then 'Submit'.\n"
+        "7. Monitor the StackSet operation until status shows SUCCEEDED."
+    )
+
+    return {
+        "browserSteps": browser_steps,
+        "cliCommands": [
+            {
+                "description": "(Optional) Inspect template parameter keys",
+                "command": discover_params_cmd,
+            },
+            {
+                "description": "Create the StackSet definition",
+                "command": create_stackset_cmd,
+            },
+            {
+                "description": "Deploy stack instances to the target OU",
+                "command": deploy_instances_cmd,
+            },
+            {
+                "description": "Check deployment status (run until all show SUCCEEDED)",
+                "command": status_cmd,
+            },
+            {
+                "description": "(Optional) Discover OU IDs if you need a different target OU",
+                "command": discover_ou_cmd,
+            },
+        ],
+        "stackSetName": stackset_name,
+        "targetOuId": target_ou_id,
+        "region": region,
+        "notes": (
+            "The StackSet deploys an IAM role into every member account in the target OU, "
+            "allowing Commvault to discover and protect resources across those accounts. "
+            "Deployment time depends on the number of member accounts (typically 1–5 minutes). "
+            "Once all instances show SUCCEEDED, call browse_aws_cloud_accounts to verify discovery."
+        ),
+    }
 
 
 _SKILL_FILE = Path(__file__).parent.parent.parent / ".claude" / "skills" / "aws-onboarding" / "SKILL.md"
+_CLEANUP_SCRIPT = Path(__file__).parent.parent.parent / "cleanup-commvault-aws.ps1"
 
 
 def get_aws_onboarding_instructions() -> dict:
@@ -981,11 +747,73 @@ def get_aws_onboarding_instructions() -> dict:
         raise ToolError(f"Failed to load AWS onboarding instructions: {str(e)}")
 
 
+def cleanup_aws_demo_environment(
+    confirmed: Annotated[
+        bool,
+        Field(
+            description=(
+                "Set to True to execute the cleanup. Omit or set to False to get a "
+                "dry-run summary of what will be deleted before committing."
+            )
+        ),
+    ] = False,
+) -> dict:
+    """Clean up / tear down / reset the Commvault AWS demo environment.
+
+    Use this tool when the user asks to:
+    - clean up AWS, tear down AWS, reset the AWS demo, undo AWS onboarding
+    - delete the Commvault CloudFormation stack or StackSet
+    - remove CommvaultPermissionsStack or CommvaultMemberAccountDiscovery
+    - start fresh, re-run onboarding from scratch, wipe the AWS setup
+
+    DESTRUCTIVE — permanently deletes:
+    - CloudFormation stack   : CommvaultPermissionsStack
+    - StackSet instances     : CommvaultMemberAccountDiscovery (OU ou-anxa-qikxlrp2)
+    - StackSet definition    : CommvaultMemberAccountDiscovery
+
+    Always call with confirmed=False first so the user can review what will be
+    deleted. Only proceed with confirmed=True after explicit user acknowledgement.
+    """
+    if not confirmed:
+        return {
+            "status": "awaiting_confirmation",
+            "message": (
+                "This will PERMANENTLY delete the following AWS resources:\n"
+                "  - CloudFormation stack    : CommvaultPermissionsStack\n"
+                "  - StackSet instances      : CommvaultMemberAccountDiscovery "
+                "(from OU ou-anxa-qikxlrp2, region us-east-1)\n"
+                "  - StackSet definition     : CommvaultMemberAccountDiscovery\n\n"
+                "To proceed, call this tool again with confirmed=True."
+            ),
+        }
+
+    if not _CLEANUP_SCRIPT.exists():
+        return {
+            "status": "error",
+            "message": f"Cleanup script not found at: {_CLEANUP_SCRIPT}",
+        }
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(_CLEANUP_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+        return {
+            "status": "completed" if result.returncode == 0 else "failed",
+            "exit_code": result.returncode,
+            "output": (result.stdout + result.stderr).strip(),
+        }
+    except Exception as e:
+        logger.error(f"Error running AWS cleanup script: {e}")
+        return {"status": "error", "message": f"Failed to run cleanup script: {str(e)}"}
+
+
 AWS_CLOUD_TOOLS = [
     get_aws_onboarding_instructions,
     get_aws_permissions_cft,
-    deploy_commvault_access_cft,
-    get_commvault_access_cft_status,
+    get_access_role_setup_steps,
+    get_member_discovery_setup_steps,
     validate_aws_cloud_credentials,
     browse_aws_cloud_accounts,
     create_aws_cloud_connection,
@@ -994,8 +822,5 @@ AWS_CLOUD_TOOLS = [
     list_eligible_plans,
     create_aws_protection_group,
     start_aws_protection_group_backup,
-    list_org_units,
-    check_member_stackset_status,
-    deploy_member_account_stackset,
-    get_stackset_deployment_status,
+    cleanup_aws_demo_environment,
 ]

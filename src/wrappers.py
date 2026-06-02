@@ -14,6 +14,8 @@
 # limitations under the License.
 # --------------------------------------------------------------------------
 
+from urllib.parse import urlparse, parse_qs, unquote
+
 from src.logger import logger
 
 
@@ -583,3 +585,42 @@ def filter_aws_permissions_cft_response(api_response):
         result[key] = entry
 
     return {"connectionTypes": result}
+
+
+def parse_cft_quick_create_params(quick_create_url: str) -> dict:
+    """Parse a CloudFormation quick-create URL into its component parts.
+
+    Returns:
+        {
+          "templateUrl": str,
+          "stackName": str,
+          "params": [{"ParameterKey": str, "ParameterValue": str}, ...]
+        }
+    The URL fragment (after ``#``) contains the actual query string, e.g.:
+    ``https://region.console.aws.amazon.com/cloudformation/home?region=us-east-1
+      #/stacks/create/review?templateURL=...&stackName=...&param_Key=Value``
+    """
+    try:
+        parsed = urlparse(quick_create_url)
+        # The real query params live in the fragment after the ``?``
+        fragment = parsed.fragment  # e.g. /stacks/create/review?templateURL=...
+        if "?" in fragment:
+            _, frag_query = fragment.split("?", 1)
+        else:
+            frag_query = ""
+
+        qs = parse_qs(frag_query, keep_blank_values=True)
+
+        template_url = unquote(qs.get("templateURL", [""])[0])
+        stack_name = qs.get("stackName", ["CommvaultPermissionsStack"])[0]
+
+        params = []
+        for key, values in qs.items():
+            if key.startswith("param_"):
+                param_key = key[len("param_"):]
+                params.append({"ParameterKey": param_key, "ParameterValue": values[0]})
+
+        return {"templateUrl": template_url, "stackName": stack_name, "params": params}
+    except Exception as exc:
+        logger.warning(f"parse_cft_quick_create_params failed for URL: {exc}")
+        return {"templateUrl": "", "stackName": "CommvaultPermissionsStack", "params": []}
