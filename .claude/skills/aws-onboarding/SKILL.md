@@ -19,12 +19,13 @@ argument-hint: 'delegated admin AWS account ID (optional)'
 - `browse_aws_cloud_accounts` — confirms account discovery through the IAM role
 - `create_aws_cloud_connection` — creates the final cloud connection
 - `list_aws_cloud_connections` — lists existing AWS cloud connections to select from
-- `list_aws_workloads` — lists available AWS workload types grouped by category
 - `list_eligible_plans` — lists backup plans eligible for an AWS protection group
 - `create_storage_pool_for_plan` — creates a storage pool required for a new plan
 - `create_server_plan` — creates a new server plan backed by the storage pool
 - `create_aws_protection_group` — creates the protection group
 - `start_aws_protection_group_backup` — starts an initial backup for the created protection group
+- `delete_aws_cloud_connection` — retires and permanently deletes a Commvault cloud connection (also removes its protection group)
+- `cleanup_aws_demo_environment` — returns ordered AWS CLI commands to delete the CloudFormation stack and StackSet created during onboarding
 
 ---
 
@@ -235,11 +236,13 @@ If zero accounts are returned:
 
 ### Step 6 — Name and create the cloud connection
 
-Recommend the name `aws-org-{accountId}` and ask for a simple confirmation:
+Derive a descriptive, human-readable name for the cloud connection from the conversation context — draw on whatever you know: the organisation or company name the user has mentioned, the purpose of the account, the AWS account ID, or any other relevant detail shared during this session. The goal is a name that is meaningful to this customer and unlikely to collide with existing connections (e.g. "acme-aws-org", "prod-aws-123456789012", "marketing-aws-org"). Do not use a rigid template.
 
-> I'll name this cloud connection **aws-org-{accountId}**. Proceed?
+Present the derived name for a simple confirmation:
 
-- **Yes** → use the suggested name.
+> I'll name this cloud connection **{derivedName}**. Proceed?
+
+- **Yes** → use the derived name.
 - **No** → ask "What name would you like?" and use the answer.
 
 Call `create_aws_cloud_connection` with the confirmed name and account ID.
@@ -279,31 +282,22 @@ If no name match is found:
 
 Continue automatically from Step 6. The connection is already available — do not call `list_aws_cloud_connections` or ask the user to pick a connection again.
 
+When introducing this section to the user, briefly explain what a protection group is in plain, friendly language. Something like:
+
+> Now we'll set up a **protection group** — think of it as a named list of cloud resources you want Commvault to watch over. It groups your AWS workloads together and ties them to a backup plan that controls how often they're backed up and how long those backups are kept. Once it's active, Commvault automatically runs backups on your schedule without you having to do anything further.
+
 ### Step 7 — Choose workloads
 
-Call `list_aws_workloads`. Group the results by category internally. Count the total number of workloads (N). Do not show IDs.
-
-Present the full list **inline per category** (comma-separated workload names on one line per category), then ask one question:
+Ask a simple confirmation — do not enumerate workloads:
 
 > **Choose Workloads**
-> Commvault can protect all {N} AWS workloads across these categories:
->
-> **File Servers:** Amazon Elastic File System
-> **Virtualization:** Amazon EC2
-> **Databases:** Amazon Aurora and RDS Snapshot, Amazon DynamoDB, Amazon Redshift
-> _(list every category and its workloads inline — one line per category)_
->
-> Should we protect all of them? Say **yes** to include everything.
+> We'll protect all AWS workloads discovered in this connection. Can we proceed?
 
-- **User says yes / all / everything** → use all N workloads and confirm:
+- **User confirms** → acknowledge and move on:
   > **Choose Workloads — Done**
-  > Selected: all {N} AWS workloads.
+  > All discovered workloads in this connection will be protected.
 
-- **User names workloads to exclude or a specific subset** → build the subset from their answer and confirm:
-  > **Choose Workloads — Done**
-  > Selected: {count} workloads — {comma-separated names}.
-
-Build the workloads JSON array internally from the confirmed selection. Do not show the JSON to the user.
+Pass `workloads_json = "[]"` and `all_cloud_accounts = true` to `create_aws_protection_group` in Step 9 — this tells Commvault to cover everything in the connection automatically.
 
 ---
 
@@ -338,21 +332,39 @@ A plan is a strong fit if **all three** of the following are true:
 
 **Show only the recommended plan.** Do not list other plans.
 
+When presenting the plan to the user, always include a plain-language explanation of what a backup plan is and what each term means. Weave these explanations naturally into the message — do not present them as a separate glossary block. Explain:
+- **Backup plan**: the set of rules that governs how your cloud data is protected — how often backups run, how many independent copies are kept, and how long they are retained before being deleted.
+- **RPO (Recovery Point Objective)**: how frequently a backup snapshot is taken. For example, "Daily" means a backup runs every day, so in the worst case you could lose at most one day's worth of changes if something goes wrong. A shorter RPO (e.g. every few hours) means less potential data loss.
+- **Copies**: the number of independent backup copies Commvault keeps. Having 2 or more copies means if one storage location has a problem, your data is still safe in another.
+- **Retention**: how long backups are kept before they are automatically removed. Longer retention lets you recover from mistakes or events discovered weeks or months later.
+
 **If the recommended plan is a strong fit:**
 
 > **Choose Plan**
-> Our recommended plan for your AWS workloads is **{planName}** — {rpoLabel}, {numCopies} copies.
-> {planSummary}
+> Before we continue, here's a quick primer on what a backup plan is and what you'll be agreeing to — this is all standard Commvault terminology, so don't worry if it's new to you.
+>
+> A **backup plan** is the rulebook for protecting your data: it defines how often backups run (the RPO), how many independent copies are kept for safety, and how long those copies are retained before being automatically deleted.
+>
+> Our recommended plan for your AWS workloads is **{planName}**:
+> - **Backup frequency (RPO):** {rpoLabel} — {plain-language explanation of what this RPO means for their data risk, e.g. "a backup runs every day, so at most one day of changes could be at risk if something goes wrong"}
+> - **Copies:** {numCopies} — {numCopies} independent copies of each backup are stored, so a single storage failure won't leave you without a recovery point
+> - **Summary:** {planSummary}
 >
 > This looks like the best match for your use case. Would you like to use it, or create a new tailored plan instead?
 
 **If the recommended plan is not a strong fit** (derive the gap in plain terms from `planSummary` and the criteria — e.g., infrequent cadence, single copy, missing retention info):
 
 > **Choose Plan**
-> **{planName}** is the closest available plan — {rpoLabel}, {numCopies} copies.
-> {planSummary}
+> Before we continue, here's a quick primer on what a backup plan is and what you'll be agreeing to — this is all standard Commvault terminology, so don't worry if it's new to you.
 >
-> It may not be the ideal fit: {plain-language reason}. Would you like to use it anyway, or let me create a new plan optimised for daily backups, 2 copies, and 30-day retention?
+> A **backup plan** is the rulebook for protecting your data: it defines how often backups run (the RPO), how many independent copies are kept for safety, and how long those copies are retained before being automatically deleted.
+>
+> The closest available plan is **{planName}**:
+> - **Backup frequency (RPO):** {rpoLabel} — {plain-language explanation of what this RPO means for their data risk}
+> - **Copies:** {numCopies} — {numCopies} independent {copy/copies} of each backup {is/are} stored
+> - **Summary:** {planSummary}
+>
+> It may not be the ideal fit: {plain-language reason — e.g. "it only keeps one copy, so a storage failure could leave you without a backup" or "backups run weekly, meaning up to a week of changes could be lost in a worst-case scenario"}. Would you like to use it anyway, or let me create a new plan optimised for daily backups, 2 copies, and 30-day retention?
 
 - **User chooses the recommended plan** → retain its `planId` and `planName`. Skip to Step 9.
 - **User wants a new plan** → proceed to Plan Creation (Step 8b).
@@ -433,19 +445,21 @@ If no name match is found:
 
 ### Step 9 — Name and create the protection group
 
-Recommend the name `{sanitizedConnectionName}-protection-group` and ask for a simple confirmation:
+Derive a descriptive, human-readable name for the protection group from the conversation context — draw on the same signals used for the connection name (organisation or company name, account purpose, environment, etc.) and append something that conveys "protection" naturally (e.g. "acme-aws-backup", "prod-aws-protection", "marketing-cloud-pg"). The name should be unique and meaningful without relying on a rigid template.
 
-> I'll name this protection group **{sanitizedConnectionName}-protection-group**. Proceed?
+Present the derived name for a simple confirmation. Briefly remind the user what this group will do:
 
-- **Yes** → use the suggested name.
+> I'll create a protection group named **{derivedName}**. This group will cover all AWS workloads in your connection and back them up using the **{planName}** plan. Proceed?
+
+- **Yes** → use the derived name.
 - **No** → ask "What name would you like?" and use the answer.
 
-Call `create_aws_protection_group` with the confirmed name.
+Call `create_aws_protection_group` with the confirmed name, passing `workloads_json = "[]"` and `all_cloud_accounts = true` so Commvault protects everything in the connection automatically.
 
 On success, say:
 
 > **Create Protection Group — Done**
-> The protection group **{name}** is now active and protecting your selected workloads.
+> The protection group **{name}** is now active and protecting your AWS workloads.
 
 Retain the protection group ID from the response internally. Continue immediately to Step 10 — do not ask the user if they want to start a backup.
 
@@ -481,3 +495,123 @@ If `summary.jobUrl` is absent, omit the tracking link:
 > The initial full backup job has been submitted. Based on your **{planName}** plan, your next scheduled backup will run **{rpoLabel}**. If any backup encounters errors, you'll be notified by email.
 >
 > Your AWS environment is now fully onboarded and protected by Commvault.
+
+---
+
+## Cleanup / Teardown
+
+### When to Use
+
+Trigger this flow whenever the user says anything that means tearing down the demo or starting over, including but not limited to:
+
+- "clean the setup", "clean demo", "clean aws", "cleanup", "clean up"
+- "tear down", "teardown", "remove aws", "delete aws setup"
+- "reset", "reset the demo", "start fresh", "undo onboarding", "wipe aws"
+
+### Opening message
+
+Call `list_aws_cloud_connections` immediately (no user input needed). Then send this opening message, substituting the actual connection name(s):
+
+> **Clean Up AWS — Working…**
+> I'll clean up everything. Here's what I'll do:
+> 1. **Delete the Commvault cloud connection** (and its protection group) — I found **{connectionName}** in Commvault.
+> 2. **Delete the AWS CloudFormation stack and StackSet** — I'll show you the exact commands and run them once you confirm.
+>
+> Both steps are irreversible. Want me to proceed?
+
+Wait for user confirmation before doing anything else. If the user confirms, proceed with Cleanup Step 1 immediately.
+
+---
+
+### Cleanup Step 1 — Delete the Commvault cloud connection
+
+If `list_aws_cloud_connections` returned more than one connection, list them and ask which to delete before proceeding. For a single connection, use it directly.
+
+Call `delete_aws_cloud_connection` with the connection's `id` and `name`.
+
+On success:
+
+> **Clean Up AWS — Done**
+> Cloud connection **{connectionName}** and its protection group have been removed from Commvault.
+
+On failure, report the error in plain language and ask the user whether to skip this step and continue with the AWS CLI cleanup or stop entirely. Do not silently skip.
+
+If no connections exist, note that and proceed directly to Cleanup Step 2.
+
+---
+
+### Cleanup Step 2 — Delete AWS CloudFormation resources
+
+Call `cleanup_aws_demo_environment` (no arguments needed for the default demo setup). The tool returns three ordered stages of AWS CLI commands.
+
+Present **all commands** to the user before running anything:
+
+> **Clean Up AWS — Needs confirmation**
+> The following AWS CLI commands will permanently delete these resources:
+> - CloudFormation stack: **CommvaultPermissionsStack**
+> - StackSet instances in OU **{targetOuId}**: **CommvaultMemberAccountDiscovery**
+> - StackSet definition: **CommvaultMemberAccountDiscovery**
+>
+> **Stage 1 — Delete access-role stack:**
+> ```
+> {stage1.commands[0].command}
+> {stage1.commands[1].command}
+> ```
+>
+> **Stage 2 — Delete StackSet instances:**
+> ```
+> {stage2.commands[0].command}
+> {stage2.commands[1].command}
+> {stage2.commands[2].command}
+> ```
+>
+> **Stage 3 — Delete StackSet definition:**
+> ```
+> {stage3.commands[0].command}
+> ```
+>
+> Confirm to run these now.
+
+After explicit user confirmation, execute the stages in order:
+
+**Stage 1:** Run the `delete-stack` command, then run `wait stack-delete-complete`. Show progress:
+> ⏳ Deleting access-role stack…
+
+On completion:
+> **Clean Up AWS — Stage 1 Done**
+> CommvaultPermissionsStack has been deleted.
+
+**Stage 2:** Run `delete-stack-instances`. Parse the `OperationId` from the JSON output. Then poll `describe-stack-set-operation` with that `OperationId` every 15 seconds until the status is `SUCCEEDED` or `FAILED`. Show progress:
+> ⏳ Removing StackSet instances from member accounts… (status: {current status})
+
+If `SUCCEEDED`, run `list-stack-instances` to verify zero instances remain (the command returns a count).
+
+If the count is `0`:
+> **Clean Up AWS — Stage 2 Done**
+> All StackSet instances have been removed from OU **{targetOuId}**.
+
+If the count is non-zero or the operation `FAILED`, stop and report:
+> **Clean Up AWS — Needs attention**
+> Some StackSet instances could not be removed. Please check the AWS console for details. I will not delete the StackSet definition until all instances are gone.
+
+If the StackSet was not found (error contains `StackSetNotFoundException`), treat that as already cleaned up and note it, then skip to the summary.
+
+**Stage 3:** Only execute if stage 2 confirmed zero instances. Run `delete-stack-set`.
+
+On success:
+> **Clean Up AWS — Done**
+> CommvaultMemberAccountDiscovery StackSet has been deleted.
+
+---
+
+### Cleanup Summary
+
+After all stages complete:
+
+> **Clean Up AWS — Done**
+> The Commvault AWS demo environment has been fully removed:
+> - Commvault cloud connection and protection group: removed
+> - CloudFormation stack CommvaultPermissionsStack: deleted
+> - StackSet CommvaultMemberAccountDiscovery: deleted from OU **{targetOuId}**
+>
+> You can run the onboarding flow again at any time to start fresh.

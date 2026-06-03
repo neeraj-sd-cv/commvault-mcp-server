@@ -20,7 +20,8 @@ from typing import Annotated, Dict, Any
 from pydantic import Field
 
 import json
-import subprocess
+
+import requests
 
 from src.cv_api_client import commvault_api_client
 from src.logger import logger
@@ -456,6 +457,19 @@ def start_aws_protection_group_backup(
             "status": "submitted",
         }
         return result
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else None
+        try:
+            body = e.response.json()
+        except Exception:
+            body = e.response.text if e.response is not None else str(e)
+        logger.error(f"HTTP {status_code} error starting AWS protection group backup: {body}")
+        return {
+            "error": True,
+            "httpStatus": status_code,
+            "message": f"Failed to start AWS protection group backup: HTTP {status_code}",
+            "apiResponse": body,
+        }
     except Exception as e:
         logger.error(f"Error starting AWS protection group backup: {e}")
         return {
@@ -729,7 +743,6 @@ def get_member_discovery_setup_steps(
 
 
 _SKILL_FILE = Path(__file__).parent.parent.parent / ".claude" / "skills" / "aws-onboarding" / "SKILL.md"
-_CLEANUP_SCRIPT = Path(__file__).parent.parent.parent / "cleanup-commvault-aws.ps1"
 
 
 def get_aws_onboarding_instructions() -> dict:
@@ -748,65 +761,226 @@ def get_aws_onboarding_instructions() -> dict:
 
 
 def cleanup_aws_demo_environment(
-    confirmed: Annotated[
-        bool,
-        Field(
-            description=(
-                "Set to True to execute the cleanup. Omit or set to False to get a "
-                "dry-run summary of what will be deleted before committing."
-            )
-        ),
-    ] = False,
+    target_ou_id: Annotated[
+        str,
+        Field(description="Target OU ID whose StackSet instances will be deleted. Defaults to the standard Commvault demo OU."),
+    ] = _DEFAULT_TARGET_OU_ID,
+    region: Annotated[
+        str,
+        Field(description="AWS region for all operations. Defaults to us-east-1."),
+    ] = "us-east-1",
+    call_as: Annotated[
+        str,
+        Field(description="CloudFormation call-as value for StackSet operations. Defaults to DELEGATED_ADMIN."),
+    ] = "DELEGATED_ADMIN",
 ) -> dict:
-    """Clean up / tear down / reset the Commvault AWS demo environment.
+    """Return ordered AWS CLI commands to tear down the Commvault AWS demo environment.
 
     Use this tool when the user asks to:
-    - clean up AWS, tear down AWS, reset the AWS demo, undo AWS onboarding
-    - delete the Commvault CloudFormation stack or StackSet
+    - clean up AWS, clean the setup, clean demo, tear down AWS, reset the AWS demo
+    - undo AWS onboarding, delete the Commvault CloudFormation stack or StackSet
     - remove CommvaultPermissionsStack or CommvaultMemberAccountDiscovery
     - start fresh, re-run onboarding from scratch, wipe the AWS setup
 
-    DESTRUCTIVE — permanently deletes:
+    DESTRUCTIVE — the returned commands permanently delete:
     - CloudFormation stack   : CommvaultPermissionsStack
-    - StackSet instances     : CommvaultMemberAccountDiscovery (OU ou-anxa-qikxlrp2)
+    - StackSet instances     : CommvaultMemberAccountDiscovery (in the target OU)
     - StackSet definition    : CommvaultMemberAccountDiscovery
 
-    Always call with confirmed=False first so the user can review what will be
-    deleted. Only proceed with confirmed=True after explicit user acknowledgement.
+    IMPORTANT — before executing any CLI commands, the agent MUST:
+      1. Call ``list_aws_cloud_connections`` and offer to delete each existing AWS
+         cloud connection by calling ``delete_aws_cloud_connection``. Deleting the
+         connection also removes its associated protection group. Ask the user to
+         confirm before deleting. Only skip this step if the user explicitly says
+         they do not want to delete the connection.
+      2. Show all CLI commands from ``cliCommands`` to the user and obtain explicit
+         confirmation before running any of them.
+
+    Execute the three CLI stages in order after confirmation:
+      1. Run stage 1 commands to delete and wait for the access-role stack.
+      2. Run stage 2 commands: delete-stack-instances, then poll
+         describe-stack-set-operation with the OperationId parsed from the
+         delete-stack-instances JSON output until status is SUCCEEDED (or FAILED).
+         Then verify zero instances remain.
+      3. Only if stage 2 succeeded with zero instances, run stage 3 to delete the
+         StackSet definition.
     """
-    if not confirmed:
-        return {
-            "status": "awaiting_confirmation",
-            "message": (
-                "This will PERMANENTLY delete the following AWS resources:\n"
-                "  - CloudFormation stack    : CommvaultPermissionsStack\n"
-                "  - StackSet instances      : CommvaultMemberAccountDiscovery "
-                "(from OU ou-anxa-qikxlrp2, region us-east-1)\n"
-                "  - StackSet definition     : CommvaultMemberAccountDiscovery\n\n"
-                "To proceed, call this tool again with confirmed=True."
-            ),
-        }
+    stack_name = _ACCESS_STACK_NAME
+    stackset_name = _STACKSET_NAME
 
-    if not _CLEANUP_SCRIPT.exists():
-        return {
-            "status": "error",
-            "message": f"Cleanup script not found at: {_CLEANUP_SCRIPT}",
-        }
+    delete_stack_cmd = (
+        f"aws cloudformation delete-stack \\\n"
+        f"  --stack-name {stack_name} \\\n"
+        f"  --region {region}"
+    )
 
+    wait_stack_cmd = (
+        f"aws cloudformation wait stack-delete-complete \\\n"
+        f"  --stack-name {stack_name} \\\n"
+        f"  --region {region}"
+    )
+
+    delete_instances_cmd = (
+        f"aws cloudformation delete-stack-instances \\\n"
+        f"  --stack-set-name {stackset_name} \\\n"
+        f"  --deployment-targets OrganizationalUnitIds={target_ou_id} \\\n"
+        f"  --regions {region} \\\n"
+        f"  --no-retain-stacks \\\n"
+        f"  --call-as {call_as} \\\n"
+        f"  --region {region} \\\n"
+        f"  --output json"
+    )
+
+    poll_operation_cmd = (
+        f"# Replace <OPERATION_ID> with the OperationId value from the delete-stack-instances output above\n"
+        f"aws cloudformation describe-stack-set-operation \\\n"
+        f"  --stack-set-name {stackset_name} \\\n"
+        f"  --operation-id <OPERATION_ID> \\\n"
+        f"  --call-as {call_as} \\\n"
+        f"  --region {region} \\\n"
+        f"  --query \"StackSetOperation.Status\" \\\n"
+        f"  --output text"
+    )
+
+    verify_instances_cmd = (
+        f"aws cloudformation list-stack-instances \\\n"
+        f"  --stack-set-name {stackset_name} \\\n"
+        f"  --call-as {call_as} \\\n"
+        f"  --region {region} \\\n"
+        f"  --query \"length(Summaries)\" \\\n"
+        f"  --output text"
+    )
+
+    delete_stackset_cmd = (
+        f"aws cloudformation delete-stack-set \\\n"
+        f"  --stack-set-name {stackset_name} \\\n"
+        f"  --call-as {call_as} \\\n"
+        f"  --region {region}"
+    )
+
+    return {
+        "stackName": stack_name,
+        "stackSetName": stackset_name,
+        "targetOuId": target_ou_id,
+        "region": region,
+        "callAs": call_as,
+        "preCleanupSteps": [
+            {
+                "step": 1,
+                "action": "delete_commvault_connection",
+                "description": (
+                    "BEFORE running any CLI commands: call list_aws_cloud_connections, "
+                    "then offer to delete each AWS cloud connection by calling "
+                    "delete_aws_cloud_connection (confirm with the user first). "
+                    "Deleting the connection also removes its associated protection group. "
+                    "Skip only if the user explicitly declines."
+                ),
+                "toolsToCall": ["list_aws_cloud_connections", "delete_aws_cloud_connection"],
+            }
+        ],
+        "cliCommands": [
+            {
+                "stage": 1,
+                "description": "Delete the Commvault access-role CloudFormation stack",
+                "commands": [
+                    {"description": "Delete the access-role stack", "command": delete_stack_cmd},
+                    {"description": "Wait for stack deletion to complete", "command": wait_stack_cmd},
+                ],
+            },
+            {
+                "stage": 2,
+                "description": "Delete CommvaultMemberAccountDiscovery StackSet instances from the OU",
+                "commands": [
+                    {
+                        "description": "Delete stack instances (capture OperationId from JSON output)",
+                        "command": delete_instances_cmd,
+                    },
+                    {
+                        "description": "Poll operation status every 15 s until SUCCEEDED or FAILED",
+                        "command": poll_operation_cmd,
+                    },
+                    {
+                        "description": "Verify zero StackSet instances remain (must return 0)",
+                        "command": verify_instances_cmd,
+                    },
+                ],
+            },
+            {
+                "stage": 3,
+                "description": "Delete the StackSet definition (only after stage 2 shows zero instances)",
+                "commands": [
+                    {"description": "Delete the StackSet definition", "command": delete_stackset_cmd},
+                ],
+            },
+        ],
+        "notes": (
+            "DESTRUCTIVE: these commands permanently delete AWS resources. "
+            "Show all commands to the user and obtain explicit confirmation before running any of them. "
+            "Execute stages in order. For stage 2, parse the OperationId from the "
+            "delete-stack-instances JSON response and substitute it into the poll command. "
+            "Only proceed to stage 3 after stage 2 reports zero remaining instances."
+        ),
+    }
+
+
+def delete_aws_cloud_connection(
+    connection_id: Annotated[
+        int,
+        Field(
+            description=(
+                "The numeric ID of the AWS cloud connection to delete "
+                "(from list_aws_cloud_connections)."
+            )
+        ),
+    ],
+    connection_name: Annotated[
+        str,
+        Field(description="Display name of the connection, used for status messages."),
+    ] = "",
+) -> dict:
+    """Retire and permanently delete an AWS cloud connection from Commvault.
+
+    Retiring the cloud connection also deletes its associated protection group
+    and stops all backup activity for that connection.
+
+    Call this as part of the cleanup / teardown flow — before running the AWS
+    CLI commands from ``cleanup_aws_demo_environment`` — to remove the Commvault
+    side of the demo setup.
+
+    Use ``list_aws_cloud_connections`` first to look up the ``connection_id``
+    if it is not already known.
+    """
     try:
-        result = subprocess.run(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(_CLEANUP_SCRIPT)],
-            capture_output=True,
-            text=True,
-        )
+        response = commvault_api_client.delete(f"Client/{connection_id}/Retire")
+        display = connection_name or str(connection_id)
         return {
-            "status": "completed" if result.returncode == 0 else "failed",
-            "exit_code": result.returncode,
-            "output": (result.stdout + result.stderr).strip(),
+            "summary": {
+                "connectionId": connection_id,
+                "connectionName": display,
+                "status": "deleted",
+                "message": f"Cloud connection '{display}' has been retired and deleted.",
+            },
+            "apiResponse": response,
+        }
+    except requests.exceptions.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else None
+        try:
+            body = e.response.json()
+        except Exception:
+            body = e.response.text if e.response is not None else str(e)
+        logger.error(f"HTTP {status_code} error deleting AWS cloud connection {connection_id}: {body}")
+        return {
+            "error": True,
+            "httpStatus": status_code,
+            "message": f"Failed to delete cloud connection: HTTP {status_code}",
+            "apiResponse": body,
         }
     except Exception as e:
-        logger.error(f"Error running AWS cleanup script: {e}")
-        return {"status": "error", "message": f"Failed to run cleanup script: {str(e)}"}
+        logger.error(f"Error deleting AWS cloud connection {connection_id}: {e}")
+        return {
+            "error": True,
+            "message": f"Failed to delete cloud connection: {str(e)}",
+        }
 
 
 AWS_CLOUD_TOOLS = [
@@ -822,5 +996,6 @@ AWS_CLOUD_TOOLS = [
     list_eligible_plans,
     create_aws_protection_group,
     start_aws_protection_group_backup,
+    delete_aws_cloud_connection,
     cleanup_aws_demo_environment,
 ]

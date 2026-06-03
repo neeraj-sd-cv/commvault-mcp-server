@@ -18,7 +18,7 @@ import json
 import threading
 import time
 from typing import Dict, Any, Optional, Union
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode
 
 import requests
 from dotenv import load_dotenv
@@ -213,6 +213,14 @@ class CommvaultApiClient:
             except requests.exceptions.HTTPError as e:
                 # Let the 401 handling above take care of auth errors
                 if e.response.status_code != 401:
+                    try:
+                        error_body = e.response.text[:2000]
+                    except Exception:
+                        error_body = "<unavailable>"
+                    logger.error(
+                        f"HTTP {e.response.status_code} error for {method} {url} — "
+                        f"response body: {error_body}"
+                    )
                     retries += 1
                     if retries > max_retries:
                         raise
@@ -252,5 +260,9 @@ class CommvaultApiClient:
              params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Make a PUT request to the API."""
         return self.request("PUT", endpoint, params=params, data=data, headers=headers)
+
+    def delete(self, endpoint: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Make a DELETE request to the API."""
+        return self.request("DELETE", endpoint, params=params, headers=headers)
 
 commvault_api_client = CommvaultApiClient(use_oauth=(get_env_var('USE_OAUTH', 'false').lower() == 'true'))
