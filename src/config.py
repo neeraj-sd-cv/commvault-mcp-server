@@ -150,4 +150,9 @@ protection, or overwrite configuration are marked destructive -- confirm intent 
 first. Read-only and preview tools never need confirmation.
 - When a scope resolves to zero matches, STOP and report it. Never silently proceed \
 as if everything matched.\
+- AWS cloud work. For any AWS-related goal — onboarding, connecting an AWS \
+account, backing up or protecting EC2/S3/RDS/EBS/EFS/DynamoDB, creating a \
+protection group, or validating AWS credentials — call \
+`get_aws_onboarding_instructions` or `load_aws_backup_protection_guide` first \
+to load the full guided workflow before proceeding.\
 """

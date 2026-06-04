@@ -746,11 +746,21 @@ _SKILL_FILE = Path(__file__).parent.parent.parent / ".claude" / "skills" / "aws-
 
 
 def get_aws_onboarding_instructions() -> dict:
-    """Return the step-by-step AWS onboarding workflow instructions.
+    """Load the complete AWS onboarding and cloud protection workflow guide.
 
-    Call this tool at the start of any AWS onboarding session to load the
-    complete guided workflow into context. The instructions cover all steps
-    from retrieving CFT links through creating the final cloud connection.
+    Call this tool FIRST whenever the user wants to do ANYTHING with AWS in Commvault,
+    including but not limited to:
+    - Onboarding an AWS account or AWS Organization
+    - Connecting AWS to Commvault (cloud connection setup)
+    - Setting up CFT (CloudFormation Template) permissions or IAM roles
+    - Protecting or backing up AWS workloads: EC2, S3, RDS, EBS, EFS, DynamoDB
+    - Creating an AWS protection group or backup plan
+    - Running or scheduling a backup job for AWS resources
+    - Validating AWS credentials or IAM role access
+    - Discovering AWS member accounts via StackSet
+
+    Returns the full step-by-step guided workflow covering every stage from
+    CFT deployment through protection group creation and initial backup.
     """
     try:
         instructions = _SKILL_FILE.read_text(encoding="utf-8")
@@ -758,6 +768,29 @@ def get_aws_onboarding_instructions() -> dict:
     except Exception as e:
         logger.error(f"Error reading AWS onboarding instructions: {e}")
         raise ToolError(f"Failed to load AWS onboarding instructions: {str(e)}")
+
+
+def load_aws_backup_protection_guide() -> dict:
+    """Load the step-by-step guide for protecting and backing up AWS cloud workloads with Commvault.
+
+    Use this tool when the user asks to:
+    - Back up EC2 instances, S3 buckets, RDS databases, EBS volumes, EFS, or DynamoDB
+    - Set up cloud backup for any AWS service
+    - Protect AWS workloads or create a cloud protection group
+    - Schedule or run backup jobs targeting AWS resources
+    - Add Commvault cloud protection to an existing AWS environment
+    - Restore AWS workloads from a Commvault backup
+    - Connect an AWS account as a Commvault cloud source
+
+    Returns the full guided workflow (identical to get_aws_onboarding_instructions)
+    covering every step from initial AWS permissions setup through backup execution.
+    """
+    try:
+        instructions = _SKILL_FILE.read_text(encoding="utf-8")
+        return {"instructions": instructions}
+    except Exception as e:
+        logger.error(f"Error reading AWS backup protection guide: {e}")
+        raise ToolError(f"Failed to load AWS backup protection guide: {str(e)}")
 
 
 def cleanup_aws_demo_environment(
@@ -985,6 +1018,7 @@ def delete_aws_cloud_connection(
 
 AWS_CLOUD_TOOLS = [
     get_aws_onboarding_instructions,
+    load_aws_backup_protection_guide,
     get_aws_permissions_cft,
     get_access_role_setup_steps,
     get_member_discovery_setup_steps,
