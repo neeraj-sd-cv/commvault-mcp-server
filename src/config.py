@@ -156,7 +156,8 @@ protection group, or validating AWS credentials — call \
 `get_aws_onboarding_instructions` or `load_aws_backup_protection_guide` first \
 to load the full guided workflow before proceeding.\
 - AWS recovery. For any AWS restore or recovery request — recovering EC2 \
-instances, S3 data, RDS databases, EBS volumes, or any other AWS workload — \
-call `get_aws_recovery_instructions` first to load the full guided recovery \
-workflow before proceeding.\
+instances, S3 data, RDS databases, EBS volumes, or any other AWS workload, \
+or when a user says their AWS resource has an issue and wants to restore it — \
+call `get_aws_recovery_instructions` or `load_aws_restore_guide` \
+first to load the full guided recovery workflow before proceeding.\
 """

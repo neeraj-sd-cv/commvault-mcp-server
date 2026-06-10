@@ -43,17 +43,18 @@ def _build_job_url(job_id) -> str | None:
 
 
 def get_aws_recovery_instructions() -> dict:
-    """Load the complete AWS VM recovery workflow guide.
+    """Load the complete AWS workload recovery workflow guide.
 
-    Call this tool FIRST whenever the user wants to restore or recover an AWS
-    virtual machine, including but not limited to:
-    - Restore an EC2 instance
-    - Recover an AWS VM
+    Call this tool FIRST whenever the user wants to restore or recover any AWS
+    workload, including but not limited to:
+    - Restore an EC2 instance, RDS database, S3 bucket, EBS volume, or EFS file system
+    - Recover any AWS resource protected by Commvault
     - Trigger an in-place restore for an AWS workload
-    - Find and restore a backed-up AWS virtual machine
-    - Undo changes on an EC2 instance by restoring from backup
+    - Find and restore a backed-up AWS workload
+    - Undo changes on an AWS resource by restoring from backup
+    - Fix a broken or corrupted AWS instance using Commvault recovery
 
-    Returns the full step-by-step guided workflow covering VM listing, user
+    Returns the full step-by-step guided workflow covering workload listing, user
     selection, UUID resolution, restore submission, and job tracking.
     """
     try:
@@ -62,6 +63,29 @@ def get_aws_recovery_instructions() -> dict:
     except Exception as e:
         logger.error(f"Error reading AWS recovery instructions: {e}")
         raise ToolError(f"Failed to load AWS recovery instructions: {str(e)}")
+
+
+def load_aws_restore_guide() -> dict:
+    """Load the step-by-step guide for restoring AWS workloads with Commvault.
+
+    Use this tool when the user asks to:
+    - Restore a VM, EC2 instance, or any AWS virtual machine
+    - Recover a broken, corrupted, or failed AWS resource from backup
+    - Perform an in-place restore or overwrite an existing AWS instance
+    - Roll back an AWS workload to a previous backup point
+    - Get back data or a working state for any AWS service protected by Commvault
+    - Find what AWS resources are available to restore
+    - "My AWS VM has an issue and I want to restore it"
+
+    Returns the full guided workflow (identical to get_aws_recovery_instructions)
+    covering every step from listing available workloads through restore job tracking.
+    """
+    try:
+        instructions = _SKILL_FILE.read_text(encoding="utf-8")
+        return {"instructions": instructions}
+    except Exception as e:
+        logger.error(f"Error reading AWS restore guide: {e}")
+        raise ToolError(f"Failed to load AWS restore guide: {str(e)}")
 
 
 def list_aws_virtual_machines() -> dict:
@@ -160,6 +184,7 @@ def restore_aws_virtual_machine(
 
 AWS_RECOVERY_TOOLS = [
     get_aws_recovery_instructions,
+    load_aws_restore_guide,
     list_aws_virtual_machines,
     restore_aws_virtual_machine,
 ]

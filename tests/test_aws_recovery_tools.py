@@ -9,6 +9,7 @@ from src.tools.aws_recovery_tools import (
     list_aws_virtual_machines,
     restore_aws_virtual_machine,
     get_aws_recovery_instructions,
+    load_aws_restore_guide,
     _build_job_url,
 )
 
@@ -202,6 +203,20 @@ class TestGetAwsRecoveryInstructions:
         text = result["instructions"]
         assert "list_aws_virtual_machines" in text
         assert "restore_aws_virtual_machine" in text
+
+
+# ---------------------------------------------------------------------------
+# Tool tests — load_aws_restore_guide
+# ---------------------------------------------------------------------------
+
+class TestLoadAwsRestoreGuide:
+    def test_loads_markdown_without_error(self):
+        result = load_aws_restore_guide()
+        assert "instructions" in result
+        assert len(result["instructions"]) > 0
+
+    def test_returns_same_content_as_recovery_instructions(self):
+        assert load_aws_restore_guide() == get_aws_recovery_instructions()
 
 
 # ---------------------------------------------------------------------------
