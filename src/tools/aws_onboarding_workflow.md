@@ -1,9 +1,3 @@
----
-name: aws-onboarding
-description: 'Guide the user through onboarding an AWS Organization to Commvault, and optionally setting up a protection group. Use when the user says: onboard AWS, set up AWS cloud connection, connect AWS, add AWS account, AWS onboarding, set up protection group, protect AWS workloads.'
-argument-hint: 'delegated admin AWS account ID (optional)'
----
-
 # AWS Cloud Onboarding and Protection Group Setup
 
 ## When to Use

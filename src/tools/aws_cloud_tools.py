@@ -742,7 +742,7 @@ def get_member_discovery_setup_steps(
     }
 
 
-_SKILL_FILE = Path(__file__).parent.parent.parent / ".claude" / "skills" / "aws-onboarding" / "SKILL.md"
+_SKILL_FILE = Path(__file__).parent / "aws_onboarding_workflow.md"
 
 
 def get_aws_onboarding_instructions() -> dict:
