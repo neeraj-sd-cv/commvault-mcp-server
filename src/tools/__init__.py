@@ -30,6 +30,7 @@ from .user_tools import USER_MANAGEMENT_TOOLS
 from .docusign_tools import DOCUSIGN_TOOLS
 from .salesforce_tools import SALESFORCE_TOOLS
 from .aws_cloud_tools import AWS_CLOUD_TOOLS
+from .aws_recovery_tools import AWS_RECOVERY_TOOLS
 from .protection_tools import PROTECTION_TOOLS
 
 # All available tool categories
@@ -45,6 +46,7 @@ ALL_TOOL_CATEGORIES = [
     DOCUSIGN_TOOLS,
     SALESFORCE_TOOLS,
     AWS_CLOUD_TOOLS,
+    AWS_RECOVERY_TOOLS,
 ]
 
 __all__ = [
@@ -60,4 +62,5 @@ __all__ = [
     'DOCUSIGN_TOOLS',
     'SALESFORCE_TOOLS',
     'AWS_CLOUD_TOOLS',
+    'AWS_RECOVERY_TOOLS',
 ]

@@ -624,3 +624,17 @@ def parse_cft_quick_create_params(quick_create_url: str) -> dict:
     except Exception as exc:
         logger.warning(f"parse_cft_quick_create_params failed for URL: {exc}")
         return {"templateUrl": "", "stackName": "CommvaultPermissionsStack", "params": []}
+
+
+def filter_virtual_machines_response(api_response):
+    """Extract name and UUID for each virtual machine — the minimal set needed for
+    the recovery flow. The agent uses the name list to ask the user which VM to
+    restore, then matches the chosen name back to the UUID before calling the
+    restore API.
+    """
+    vms = api_response.get("virtualMachines", [])
+    filtered = [{"name": vm.get("name", ""), "UUID": vm.get("UUID", "")} for vm in vms]
+    return {
+        "virtualMachinesCount": api_response.get("virtualMachinesCount", len(filtered)),
+        "virtualMachines": filtered,
+    }

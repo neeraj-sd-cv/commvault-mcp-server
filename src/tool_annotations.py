@@ -49,6 +49,7 @@ _MUTATING = {
     "create_send_logs_job_for_commcell": dict(title="Send CommCell logs",                  destructiveHint=False, idempotentHint=False),
     "setup_docusign_backup_vault":       dict(title="Set up DocuSign backup vault",        destructiveHint=True,  idempotentHint=True),
     "trigger_docusign_backup":           dict(title="Trigger a DocuSign backup",           destructiveHint=False, idempotentHint=False),
+    "restore_aws_virtual_machine":       dict(title="Restore an AWS virtual machine",      destructiveHint=True,  idempotentHint=False),
     "schedule_docusign_backup":          dict(title="Schedule DocuSign backups",           destructiveHint=False, idempotentHint=True),
     "recover_docusign_envelope":         dict(title="Recover a DocuSign envelope",         destructiveHint=False, idempotentHint=False),
 }
